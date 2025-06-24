@@ -1,0 +1,4048 @@
+
+
+==================================================
+// seed.js
+==================================================
+
+import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcrypt';
+
+const prisma = new PrismaClient();
+
+async function main() {
+  const email = 'admin@gmail.com';
+  const password = 'Admin123';
+  const role = 'Admin'; // Works for both String and Role enum
+
+  // Check if admin user already exists
+  const existingUser = await prisma.user.findUnique({
+    where: { email },
+  });
+
+  if (existingUser) {
+    console.log(`Admin user with email ${email} already exists.`);
+    return;
+  }
+
+  // Hash the password
+  const passwordHash = await bcrypt.hash(password, 10);
+
+  // Create admin user
+  await prisma.user.create({
+    data: {
+      email,
+      passwordHash,
+      role,
+    },
+  });
+
+  console.log(`Admin user created: ${email}`);
+}
+
+main()
+  .catch((e) => {
+    console.error('Error seeding database:', e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
+
+==================================================
+// index.js
+==================================================
+
+import express from 'express';
+import cors from 'cors';
+import config from './config/default.js';
+import crypto from 'crypto';
+import rateLimit from 'express-rate-limit';
+import { PrismaClient } from '@prisma/client';
+import { authMiddleware, requireRole } from './api/middleware/auth.middleware.js';
+import summarizeRouter from './api/routes/summarize.routes.js';
+import adminRouter from './api/routes/admin.routes.js';
+import authRouter from './api/routes/auth.routes.js';
+import editorRouter from './api/routes/editor.routes.js';
+import errorHandler from './api/middleware/errorHandler.js';
+import { redisClient } from './utils/cache.js';
+import { lookup } from 'dns';
+import { promisify } from 'util';
+import net from 'net';
+
+// Ensure critical secrets are set
+if (!config.accessTokenSecret) {
+  console.error('✖ ACCESS_TOKEN_SECRET must be set');
+  process.exit(1);
+}
+if (!config.summarizeRateLimit?.windowMs || !config.summarizeRateLimit?.max) {
+  console.error('✖ Summarize rate-limit config missing');
+  process.exit(1);
+}
+
+// Initialize ORM
+const prisma = new PrismaClient();
+
+// Create Express app
+const app = express();
+
+// CORS: restrict to allowed frontend origins
+app.use(cors({ origin: config.allowedOrigins }));
+app.use(express.json());
+
+// === Rate-limit the token handshake to prevent token-spamming ===
+const keyLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10,             // max 10 token requests per minute
+  handler: (_, res) =>
+    res.status(429).json({ error: 'Too many token requests, please try again later' }),
+});
+
+// === Handshake endpoint: issue short-lived signed token ===
+app.get('/api/key', keyLimiter, (req, res) => {
+  const payload = JSON.stringify({ ts: Date.now() });
+  const signature = crypto
+    .createHmac('sha256', config.accessTokenSecret)
+    .update(payload)
+    .digest('hex');
+
+  const token = Buffer.from(payload).toString('base64') + '.' + signature;
+  res.json({ token });
+});
+
+// === URL-validation middleware to prevent SSRF ===
+const validateUrl = async (req, res, next) => {
+  const { url } = req.body;
+  if (!url) return next();
+
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return res.status(400).json({ error: 'Invalid URL format' });
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return res.status(400).json({ error: 'URL must use http or https' });
+  }
+
+  // Resolve hostname to check for private IPs
+  try {
+    const addresses = await promisify(lookup)(parsed.hostname, { all: true });
+    for (const { address } of addresses) {
+      if (net.isIP(address) && (
+        address.startsWith('10.') ||
+        address.startsWith('172.16.') ||
+        address.startsWith('192.168.') ||
+        net.isIPv6(address) && address.startsWith('fc00:')
+      )) {
+        return res.status(400).json({ error: 'URL resolves to a private IP' });
+      }
+    }
+  } catch {
+    // DNS errors treated as invalid URL
+    return res.status(400).json({ error: 'Unable to resolve URL hostname' });
+  }
+
+  next();
+};
+
+// === Summarize endpoint: verify token, rate-limit, validate URL, then route ===
+const summarizeLimiter = rateLimit({
+  windowMs: config.summarizeRateLimit.windowMs,
+  max: config.summarizeRateLimit.max,
+  keyGenerator: (req) => req.headers['x-access-token'] || req.ip,
+  handler: (_, res) => res.status(429).json({ error: 'Too many summarization requests' }),
+});
+
+// Token verification middleware
+const verifyAccessToken = (req, res, next) => {
+  const token = req.headers['x-access-token'];
+  if (!token) return res.status(401).json({ error: 'Missing access token' });
+
+  const [b64, sig] = token.split('.');
+  let payload;
+  try {
+    payload = Buffer.from(b64, 'base64').toString();
+  } catch {
+    return res.status(400).json({ error: 'Invalid token format' });
+  }
+
+  const expectedSig = crypto
+    .createHmac('sha256', config.accessTokenSecret)
+    .update(payload)
+    .digest('hex');
+
+  // Prevent timing attacks
+  const sigBuf = Buffer.from(sig);
+  const expBuf = Buffer.from(expectedSig);
+  if (
+    sigBuf.length !== expBuf.length ||
+    !crypto.timingSafeEqual(sigBuf, expBuf)
+  ) {
+    return res.status(401).json({ error: 'Invalid token signature' });
+  }
+
+  let data;
+  try {
+    data = JSON.parse(payload);
+  } catch {
+    return res.status(400).json({ error: 'Invalid token payload' });
+  }
+
+  if (Date.now() - data.ts > config.accessTokenTTL) {
+    return res.status(401).json({ error: 'Token expired' });
+  }
+
+  next();
+};
+
+// Mount summarization with all middleware
+app.use(
+  '/api/summarize',
+  verifyAccessToken,
+  summarizeLimiter,
+  validateUrl,
+  summarizeRouter
+);
+
+// Mount auth routes (public for login, signup, reset)
+app.use('/api/auth', authRouter);
+
+// Mount editor routes (protected: Editor OR Admin)
+app.use(
+  '/api/editor',
+  authMiddleware,
+  requireRole(['Editor', 'Admin']),
+  editorRouter
+);
+
+// Mount admin routes (protected: Admin ONLY)
+app.use(
+  '/api/admin',
+  authMiddleware,
+  requireRole(['Admin']),
+  adminRouter
+);
+
+// Health check endpoint
+app.get('/health', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    await redisClient.ping();
+    res.status(200).json({ status: 'OK' });
+  } catch (err) {
+    console.error('Health check failed:', err);
+    res.status(500).json({ status: 'ERROR' });
+  }
+});
+
+// Central error handler
+app.use(errorHandler);
+
+// Start server
+const port = config.port;
+app.listen(port, () => console.log(`🟢 Server running at http://localhost:${port}`));
+
+
+==================================================
+// models.js
+==================================================
+
+// config/models.js
+import dotenv from 'dotenv';
+dotenv.config();
+
+export const MODEL_STRATEGY = {
+  // Strategy for model selection
+  AUTO_SELECT: process.env.MODEL_AUTO_SELECT === 'true', // Default: true
+  
+  // Cost limits
+  MAX_COST_PER_ARTICLE: parseFloat(process.env.MAX_COST_PER_ARTICLE || '0.10'), // $0.10 default
+  MAX_COST_PER_BATCH: parseFloat(process.env.MAX_COST_PER_BATCH || '5.00'),     // $5.00 default
+  
+  // Content size thresholds for auto-model selection
+  THRESHOLDS: {
+    NANO_MAX_CHARS: parseInt(process.env.NANO_MAX_CHARS || '15000'),     // ~4k tokens
+    MINI_MAX_CHARS: parseInt(process.env.MINI_MAX_CHARS || '120000'),    // ~30k tokens  
+    STANDARD_MAX_CHARS: parseInt(process.env.STANDARD_MAX_CHARS || '400000'), // ~100k tokens
+  },
+  
+  // Model preferences (1 = highest priority, 4 = lowest)
+  PREFERENCES: {
+    COST_OPTIMIZED: ['gpt-4.1-nano', 'gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo'],
+    QUALITY_OPTIMIZED: ['gpt-4o', 'gpt-4-turbo', 'gpt-4o-mini', 'gpt-4.1-nano'],
+    BALANCED: ['gpt-4o-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4-turbo']
+  },
+  
+  // Current strategy
+  CURRENT_STRATEGY: process.env.MODEL_STRATEGY || 'COST_OPTIMIZED', // COST_OPTIMIZED, QUALITY_OPTIMIZED, BALANCED
+  
+  // Fallback model when all else fails
+  FALLBACK_MODEL: process.env.FALLBACK_MODEL || 'gpt-4.1-nano',
+  
+  // Enable/disable model switching based on content size
+  DYNAMIC_SWITCHING: process.env.DYNAMIC_MODEL_SWITCHING !== 'false', // Default: true
+  
+  // Cache summaries with model-specific keys
+  MODEL_SPECIFIC_CACHE: process.env.MODEL_SPECIFIC_CACHE === 'true', // Default: false
+};
+
+// Helper function to get model order based on strategy
+export function getModelPreferenceOrder(strategy = MODEL_STRATEGY.CURRENT_STRATEGY) {
+  return MODEL_STRATEGY.PREFERENCES[strategy] || MODEL_STRATEGY.PREFERENCES.COST_OPTIMIZED;
+}
+
+// Helper function to check if cost is within limits
+export function isWithinCostLimits(cost, isArticle = true) {
+  const limit = isArticle ? MODEL_STRATEGY.MAX_COST_PER_ARTICLE : MODEL_STRATEGY.MAX_COST_PER_BATCH;
+  return cost <= limit;
+}
+
+// Helper function to suggest model based on content length
+export function suggestModelByLength(textLength, strategy = MODEL_STRATEGY.CURRENT_STRATEGY) {
+  const { NANO_MAX_CHARS, MINI_MAX_CHARS, STANDARD_MAX_CHARS } = MODEL_STRATEGY.THRESHOLDS;
+  const preferenceOrder = getModelPreferenceOrder(strategy);
+  
+  if (textLength <= NANO_MAX_CHARS) {
+    // Can use any model, return by preference
+    return preferenceOrder[0];
+  } else if (textLength <= MINI_MAX_CHARS) {
+    // Need at least mini or better
+    return preferenceOrder.find(model => !model.includes('nano')) || 'gpt-4o-mini';
+  } else if (textLength <= STANDARD_MAX_CHARS) {
+    // Need standard models
+    return preferenceOrder.find(model => 
+      model.includes('4o') || model.includes('turbo')
+    ) || 'gpt-4o';
+  } else {
+    // Very large content, need most capable model
+    return 'gpt-4-turbo';
+  }
+}
+
+export default {
+  MODEL_STRATEGY,
+  getModelPreferenceOrder,
+  isWithinCostLimits,
+  suggestModelByLength
+};
+
+==================================================
+// default.js
+==================================================
+
+import dotenv from 'dotenv';
+dotenv.config();
+
+export default {
+  port: process.env.PORT || 4000,
+  databaseUrl: process.env.DATABASE_URL,
+  redisUrl: process.env.REDIS_URL,
+  openaiApiKey: process.env.OPENAI_API_KEY,
+
+  // JWT secrets
+  JWT_SECRET: process.env.JWT_SECRET,
+  JWT_RESET_SECRET: process.env.JWT_RESET_SECRET,
+  RESET_TOKEN_EXPIRY: process.env.RESET_TOKEN_EXPIRY || '1h', // default 1 hour
+
+  // Frontend URL for password‐reset links
+  FRONTEND_URL: process.env.FRONTEND_URL,
+
+  // SMTP settings for sending emails
+  SMTP_HOST: process.env.SMTP_HOST,
+  SMTP_PORT: process.env.SMTP_PORT,
+  SMTP_USER: process.env.SMTP_USER,
+  SMTP_PASS: process.env.SMTP_PASS,
+
+  // CORS: allowed origins for your public frontend
+  allowedOrigins: [
+    process.env.FRONTEND_URL,               // e.g. https://app.yoursite.com
+    'http://localhost:8080'                 // your local dev client
+  ],
+
+  // Access-token handshake (short-lived HMAC tokens)
+  accessTokenSecret: process.env.ACCESS_TOKEN_SECRET || 'replace-with-a-strong-random-secret',
+  accessTokenTTL: parseInt(process.env.ACCESS_TOKEN_TTL_MS, 10) || 5 * 60 * 1000,  // default 5 minutes
+
+  // Rate-limit settings for the /api/summarize endpoint
+  summarizeRateLimit: {
+    windowMs: parseInt(process.env.SUMMARIZE_RATE_WINDOW_MS, 10) || 60 * 60 * 1000,  // 1 hour
+    max: parseInt(process.env.SUMMARIZE_RATE_MAX, 10) || 100                         // 100 calls per window
+  }
+};
+
+
+==================================================
+// cache.js
+==================================================
+
+import { createClient } from 'redis';
+import config from '../config/default.js';
+
+export const redisClient = createClient({ url: config.redisUrl });
+redisClient.on('error', err => console.error('Redis Error', err));
+await redisClient.connect();
+
+export const getCache = (key) => redisClient.get(key);
+export const setCache = (key, value, ttl) => redisClient.set(key, value, { EX: ttl });
+
+
+==================================================
+// queue.js
+==================================================
+
+import { Queue } from 'bullmq';
+import IORedis from 'ioredis';
+import config from '../config/default.js';
+
+const connection = new IORedis(config.redisUrl);
+export const summaryQueue = new Queue('summary', { connection });
+
+
+==================================================
+// mailer.js
+==================================================
+
+// utils/mailer.js
+import nodemailer from 'nodemailer';
+import config from '../config/default.js';
+
+const transporter = nodemailer.createTransport({
+  host: config.SMTP_HOST,
+  port: Number(config.SMTP_PORT),
+  secure: false, // false for port 587
+  auth: {
+    user: config.SMTP_USER,
+    pass: config.SMTP_PASS,
+  },
+});
+
+export const sendPasswordResetEmail = async ({ toEmail, resetLink }) => {
+  const mailOptions = {
+    from: `"SnapNews" <${config.SMTP_USER}>`,
+    to: toEmail,
+    subject: 'Password Reset Request',
+    html: `
+      <p>Hello,</p>
+      <p>You requested a password reset. Click the link below to choose a new password:</p>
+      <p><a href="${resetLink}">${resetLink}</a></p>
+      <p>If you did not request this, you can safely ignore this email.</p>
+      <br/>
+      <p>— Your App Team</p>
+    `,
+  };
+
+  await transporter.sendMail(mailOptions);
+};
+
+
+==================================================
+// summaryWorker.js
+==================================================
+
+/ src/workers/summaryWorker.js
+import { Worker } from 'bullmq';
+import { summaryQueue } from '../utils/queue.js';
+import contentFetcher from '../services/contentFetcher.js';
+import languageDetector from '../services/languageDetector.js';
+import summarizer from '../services/summarizer.js';
+import { setCache } from '../utils/cache.js';
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+new Worker('summary', async job => {
+  const { articleId, url } = job.data;
+  const key = `summary:${articleId || url}`;
+  try {
+    const { title, text } = await contentFetcher.fetch(url);
+    const language = languageDetector.detect(text);
+    const { html: summaryHtml, modelUsed, promptTokens, responseTokens } =
+      await summarizer.summarize({ title, text, language });
+
+    const existing = await prisma.summary.findUnique({ where: { articleId } });
+    if (existing) {
+      await prisma.summary.update({
+        where: { articleId },
+        data: { title, language, summaryHtml, modelUsed, promptTokens, responseTokens, status: 'completed' }
+      });
+    } else {
+      await prisma.summary.create({
+        data: { articleId, title, language, summaryHtml, modelUsed, promptTokens, responseTokens, status: 'completed' }
+      });
+    }
+
+    await setCache(key, summaryHtml, 60 * 60 * 24);
+  } catch (err) {
+    console.error('Worker error:', err);
+    await prisma.summary.update({
+      where: { articleId },
+      data: { status: 'failed', errorMsg: err.message }
+    });
+  }
+});
+
+console.log('🛠 Summary worker started');
+
+
+==================================================
+// auth.middleware.js
+==================================================
+
+// middleware/auth.middleware.js
+
+import jwt from 'jsonwebtoken';
+import { PrismaClient } from '@prisma/client';
+import dotenv from 'dotenv';
+dotenv.config();
+const prisma = new PrismaClient();
+
+const authMiddleware = async (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await prisma.user.findUnique({ where: { id: decoded.userId } });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    req.user = user;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+};
+
+const requireRole = (roles) => (req, res, next) => {
+  if (!roles.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Insufficient permissions' });
+  }
+  next();
+};
+
+
+export { authMiddleware, requireRole };
+
+
+==================================================
+// errorHandler.js
+==================================================
+
+export default (err, req, res, next) => {
+  console.error(err);
+  const status = res.statusCode === 200 ? 500 : res.statusCode;
+  res.status(status).json({ error: err.message });
+};
+
+
+==================================================
+// editor.controller.js
+==================================================
+
+// controllers/editor.controller.js
+
+import { PrismaClient } from '@prisma/client';
+
+const prisma = new PrismaClient();
+
+/**
+ * GET /api/editor/summaries
+ * Return all summaries (sorted by updatedAt desc).
+ */
+export const listSummaries = async (req, res, next) => {
+  try {
+    const summaries = await prisma.summary.findMany({
+      orderBy: { updatedAt: 'desc' },
+    });
+    return res.json({ summaries });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/editor/summaries/:id
+ * Return a single summary by ID.
+ */
+export const getSummary = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const summary = await prisma.summary.findUnique({
+      where: { id },
+    });
+    if (!summary) {
+      return res.status(404).json({ error: 'Summary not found' });
+    }
+    return res.json({ summary });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * PUT /api/editor/summaries/:id
+ * Allow editing of certain fields: title, status, errorMsg.
+ * Body may contain { title?: string, status?: string, errorMsg?: string }
+ */
+export const updateSummary = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { title, status, errorMsg } = req.body;
+
+    // Check if summary exists
+    const existing = await prisma.summary.findUnique({ where: { id } });
+    if (!existing) {
+      return res.status(404).json({ error: 'Summary not found' });
+    }
+
+    // Build a data object with only the fields that were provided
+    const dataToUpdate = {};
+    if (typeof title === 'string') {
+      dataToUpdate.title = title;
+    }
+    if (typeof status === 'string') {
+      dataToUpdate.status = status;
+    }
+    if (typeof errorMsg === 'string') {
+      dataToUpdate.errorMsg = errorMsg;
+    }
+
+    const updated = await prisma.summary.update({
+      where: { id },
+      data: dataToUpdate,
+    });
+
+    return res.json({ summary: updated });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+==================================================
+// editor.batch.controller.js
+==================================================
+
+// src/api/controllers/editor.batch.controller.js - SIMPLIFIED VERSION
+
+import { PrismaClient } from '@prisma/client';
+import contentFetcher from '../../services/contentFetcher.js';
+import languageDetector from '../../services/languageDetector.js';
+import summarizer from '../../services/summarizer.js';
+
+const prisma = new PrismaClient();
+
+/**
+ * POST /api/editor/summaries/batch
+ * SIMPLIFIED: Editor selects model, no auto-selection complexity
+ */
+export const runBatchSummaries = async (req, res, next) => {
+  try {
+    const { 
+      items, 
+      model = 'gpt-4.1-nano',  // Default to nano, editor can change
+      promptTemplate
+    } = req.body;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: '`items` must be a non-empty array of { url }.' });
+    }
+
+    // Validate model
+    if (!summarizer.MODEL_CONFIGS[model]) {
+      return res.status(400).json({ 
+        error: `Invalid model: ${model}. Available models: ${Object.keys(summarizer.MODEL_CONFIGS).join(', ')}` 
+      });
+    }
+
+    const results = [];
+    let totalCost = 0;
+    const modelUsageStats = {};
+
+    console.log(`🚀 Starting batch processing of ${items.length} articles`);
+    console.log(`🤖 Using model: ${model}`);
+
+    // Process each URL sequentially
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const url = item.url?.trim();
+      
+      console.log(`\n📄 Processing article ${i + 1}/${items.length}: ${url}`);
+      
+      if (!url) {
+        results.push({
+          articleId: item.url || 'undefined',
+          status: 'error',
+          errorMsg: 'Invalid URL',
+        });
+        continue;
+      }
+
+      try {
+        // 1) Fetch title & text
+        const { title, text } = await contentFetcher.fetch(url);
+        console.log(`📖 Fetched: "${title}" (${text.length} chars)`);
+
+        // 2) Detect language
+        const language = languageDetector.detect(text);
+        console.log(`🌐 Detected language: ${language}`);
+
+        // 3) Estimate cost and warn if high
+        const estimate = summarizer.estimateCost(title, text, language, model);
+        if (estimate.warning) {
+          console.log(`⚠️ ${estimate.warning}`);
+        }
+
+        // 4) Summarize with selected model (let OpenAI handle any size issues)
+        const summaryResult = await summarizer.summarize({
+          title,
+          text,
+          language,
+          model
+        });
+
+        const { 
+          html, 
+          modelUsed, 
+          promptTokens, 
+          responseTokens, 
+          estimatedCost
+        } = summaryResult;
+
+        // Track model usage statistics
+        if (!modelUsageStats[modelUsed]) {
+          modelUsageStats[modelUsed] = { count: 0, totalCost: 0 };
+        }
+        modelUsageStats[modelUsed].count++;
+        modelUsageStats[modelUsed].totalCost += estimatedCost || 0;
+        totalCost += estimatedCost || 0;
+
+        console.log(`✅ Summary generated successfully (cost: $${(estimatedCost || 0).toFixed(6)})`);
+
+        // 5) Save to database
+        const existing = await prisma.summary.findUnique({
+          where: { articleId: url },
+        });
+
+        const summaryData = {
+          title,
+          language,
+          summaryHtml: html,
+          modelUsed,
+          promptTokens,
+          responseTokens,
+          status: 'completed',
+          estimatedCost: estimatedCost || 0,
+          modelSelectionReason: 'manual',
+          wasTruncated: false
+        };
+
+        if (existing) {
+          await prisma.summary.update({
+            where: { articleId: url },
+            data: summaryData,
+          });
+        } else {
+          await prisma.summary.create({
+            data: {
+              articleId: url,
+              ...summaryData,
+            },
+          });
+        }
+
+        results.push({ 
+          articleId: url, 
+          status: 'completed',
+          modelUsed,
+          estimatedCost: estimatedCost || 0,
+          language,
+          wasTruncated: false
+        });
+
+      } catch (err) {
+        console.error(`❌ Error processing URL ${url}:`, err.message);
+        
+        // Save error record
+        try {
+          await prisma.summary.upsert({
+            where: { articleId: url },
+            update: { 
+              status: 'failed', 
+              errorMsg: err.message || 'Unknown error',
+              modelUsed: model
+            },
+            create: {
+              articleId: url,
+              title: '',
+              language: '',
+              summaryHtml: '',
+              modelUsed: model,
+              promptTokens: 0,
+              responseTokens: 0,
+              status: 'failed',
+              errorMsg: err.message || 'Unknown error',
+              estimatedCost: 0
+            },
+          });
+        } catch (dbErr) {
+          console.error('Failed to save error record:', dbErr.message);
+        }
+
+        results.push({
+          articleId: url,
+          status: 'error',
+          errorMsg: err.message || 'Failed to summarize',
+        });
+      }
+    }
+
+    console.log(`\n🏁 Batch processing completed!`);
+    console.log(`💰 Total estimated cost: $${totalCost.toFixed(6)}`);
+    console.log(`📊 Model usage:`, modelUsageStats);
+
+    return res.json({ 
+      results,
+      summary: {
+        totalProcessed: items.length,
+        successful: results.filter(r => r.status === 'completed').length,
+        failed: results.filter(r => r.status === 'error').length,
+        totalEstimatedCost: totalCost,
+        modelUsageStats,
+        averageCostPerArticle: items.length > 0 ? totalCost / items.length : 0
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/editor/models
+ * Get available models and their capabilities
+ */
+export const getAvailableModels = async (req, res, next) => {
+  try {
+    const models = summarizer.getAvailableModels();
+    return res.json({ models });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/editor/estimate-cost
+ * Estimate cost for processing specific content
+ */
+export const estimateProcessingCost = async (req, res, next) => {
+  try {
+    const { url, title: bodyTitle, text: bodyText, model = 'gpt-4.1-nano' } = req.body;
+
+    let title, text;
+    
+    if (bodyTitle && bodyText) {
+      title = bodyTitle;
+      text = bodyText;
+    } else if (url) {
+      ({ title, text } = await contentFetcher.fetch(url));
+    } else {
+      return res.status(400).json({ 
+        error: 'Either url or both title and text must be provided' 
+      });
+    }
+
+    const language = languageDetector.detect(text);
+    
+    // Get estimates for all models or specific model
+    const models = model === 'all' 
+      ? Object.keys(summarizer.MODEL_CONFIGS)
+      : [model];
+
+    const estimates = models.map(modelName => {
+      try {
+        return summarizer.estimateCost(title, text, language, modelName);
+      } catch (err) {
+        return {
+          modelName,
+          error: err.message
+        };
+      }
+    });
+
+    return res.json({
+      title,
+      language,
+      textLength: text.length,
+      estimates
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+==================================================
+// analytics.controller.js
+==================================================
+
+// src/api/controllers/analytics.controller.js
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+// Model pricing for cost calculations
+const MODEL_PRICING = {
+  'gpt-4.1-nano': { promptTokenCost: 0.10 / 1000000, responseTokenCost: 0.40 / 1000000 },
+  'gpt-4.1-mini': { promptTokenCost: 0.40 / 1000000, responseTokenCost: 1.60 / 1000000 },
+  'gpt-4o-mini': { promptTokenCost: 0.15 / 1000000, responseTokenCost: 0.60 / 1000000 },
+  'gpt-4o': { promptTokenCost: 2.50 / 1000000, responseTokenCost: 10.00 / 1000000 },
+  'gpt-4-turbo': { promptTokenCost: 10.00 / 1000000, responseTokenCost: 30.00 / 1000000 },
+  'default': { promptTokenCost: 0.10 / 1000000, responseTokenCost: 0.40 / 1000000 }
+};
+
+function calculateCost(promptTokens, responseTokens, modelUsed) {
+  const pricing = MODEL_PRICING[modelUsed] || MODEL_PRICING['default'];
+  return (promptTokens * pricing.promptTokenCost) + (responseTokens * pricing.responseTokenCost);
+}
+
+/**
+ * GET /api/admin/analytics/overview
+ * Get comprehensive analytics overview with time-based data
+ */
+export const getAnalyticsOverview = async (req, res, next) => {
+  try {
+    const { timeRange = '30d' } = req.query; // '7d', '30d', '90d', '1y'
+    
+    // Calculate date range
+    const now = new Date();
+    let startDate = new Date();
+    
+    switch (timeRange) {
+      case '7d':
+        startDate.setDate(now.getDate() - 7);
+        break;
+      case '30d':
+        startDate.setDate(now.getDate() - 30);
+        break;
+      case '90d':
+        startDate.setDate(now.getDate() - 90);
+        break;
+      case '1y':
+        startDate.setFullYear(now.getFullYear() - 1);
+        break;
+      default:
+        startDate.setDate(now.getDate() - 30);
+    }
+
+    // 1. Summary counts and basic metrics
+    const totalSummaries = await prisma.summary.count({
+      where: { createdAt: { gte: startDate } }
+    });
+
+    const completedSummaries = await prisma.summary.count({
+      where: { 
+        status: 'completed',
+        createdAt: { gte: startDate }
+      }
+    });
+
+    const failedSummaries = await prisma.summary.count({
+      where: { 
+        status: 'failed',
+        createdAt: { gte: startDate }
+      }
+    });
+
+    // 2. Cost analysis for the period
+    const summariesWithCosts = await prisma.summary.findMany({
+      where: {
+        status: 'completed',
+        createdAt: { gte: startDate }
+      },
+      select: {
+        promptTokens: true,
+        responseTokens: true,
+        modelUsed: true,
+        estimatedCost: true,
+        createdAt: true
+      }
+    });
+
+    let totalCost = 0;
+    const costByDay = {};
+    
+    summariesWithCosts.forEach(summary => {
+      const cost = summary.estimatedCost || calculateCost(
+        summary.promptTokens || 0,
+        summary.responseTokens || 0,
+        summary.modelUsed
+      );
+      
+      totalCost += cost;
+      
+      // Group by day for daily cost chart
+      const dayKey = summary.createdAt.toISOString().split('T')[0];
+      if (!costByDay[dayKey]) {
+        costByDay[dayKey] = 0;
+      }
+      costByDay[dayKey] += cost;
+    });
+
+    // 3. Model usage analytics
+    const modelUsage = await prisma.summary.aggregateRaw({
+      pipeline: [
+        { $match: { 
+          status: 'completed',
+          createdAt: { $gte: startDate }
+        }},
+        {
+          $group: {
+            _id: '$modelUsed',
+            count: { $sum: 1 },
+            totalPromptTokens: { $sum: '$promptTokens' },
+            totalResponseTokens: { $sum: '$responseTokens' },
+            avgPromptTokens: { $avg: '$promptTokens' },
+            avgResponseTokens: { $avg: '$responseTokens' }
+          }
+        },
+        { $sort: { count: -1 } }
+      ]
+    });
+
+    // 4. Language distribution
+    const languageStats = await prisma.summary.aggregateRaw({
+      pipeline: [
+        { $match: { 
+          status: 'completed',
+          createdAt: { $gte: startDate }
+        }},
+        {
+          $group: {
+            _id: '$language',
+            count: { $sum: 1 },
+            avgCost: { $avg: '$estimatedCost' }
+          }
+        },
+        { $sort: { count: -1 } },
+        { $limit: 10 }
+      ]
+    });
+
+    // 5. Daily activity trends
+    const dailyActivity = await prisma.summary.aggregateRaw({
+      pipeline: [
+        { $match: { createdAt: { $gte: startDate } }},
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: '%Y-%m-%d',
+                date: '$createdAt'
+              }
+            },
+            total: { $sum: 1 },
+            completed: {
+              $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
+            },
+            failed: {
+              $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] }
+            }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]
+    });
+
+    // 6. Performance metrics
+    const performanceMetrics = await prisma.summary.aggregateRaw({
+      pipeline: [
+        { $match: { 
+          status: 'completed',
+          createdAt: { $gte: startDate }
+        }},
+        {
+          $group: {
+            _id: null,
+            avgPromptTokens: { $avg: '$promptTokens' },
+            avgResponseTokens: { $avg: '$responseTokens' },
+            avgCost: { $avg: '$estimatedCost' },
+            maxCost: { $max: '$estimatedCost' },
+            minCost: { $min: '$estimatedCost' }
+          }
+        }
+      ]
+    });
+
+    return res.json({
+      overview: {
+        totalSummaries,
+        completedSummaries,
+        failedSummaries,
+        successRate: totalSummaries > 0 ? (completedSummaries / totalSummaries * 100) : 0,
+        totalCost: Number(totalCost.toFixed(6)),
+        avgCostPerSummary: completedSummaries > 0 ? Number((totalCost / completedSummaries).toFixed(6)) : 0
+      },
+      costByDay: Object.entries(costByDay).map(([date, cost]) => ({
+        date,
+        cost: Number(cost.toFixed(6))
+      })).sort((a, b) => a.date.localeCompare(b.date)),
+      modelUsage: Array.isArray(modelUsage) ? modelUsage.map(item => ({
+        model: item._id,
+        count: item.count,
+        totalTokens: (item.totalPromptTokens || 0) + (item.totalResponseTokens || 0),
+        avgPromptTokens: Math.round(item.avgPromptTokens || 0),
+        avgResponseTokens: Math.round(item.avgResponseTokens || 0),
+        estimatedCost: calculateCost(
+          item.totalPromptTokens || 0,
+          item.totalResponseTokens || 0,
+          item._id
+        )
+      })) : [],
+      languageStats: Array.isArray(languageStats) ? languageStats.map(item => ({
+        language: item._id || 'Unknown',
+        count: item.count,
+        avgCost: Number((item.avgCost || 0).toFixed(6))
+      })) : [],
+      dailyActivity: Array.isArray(dailyActivity) ? dailyActivity.map(item => ({
+        date: item._id,
+        total: item.total,
+        completed: item.completed,
+        failed: item.failed,
+        successRate: item.total > 0 ? (item.completed / item.total * 100) : 0
+      })) : [],
+      performance: performanceMetrics.length > 0 ? {
+        avgPromptTokens: Math.round(performanceMetrics[0].avgPromptTokens || 0),
+        avgResponseTokens: Math.round(performanceMetrics[0].avgResponseTokens || 0),
+        avgCost: Number((performanceMetrics[0].avgCost || 0).toFixed(6)),
+        maxCost: Number((performanceMetrics[0].maxCost || 0).toFixed(6)),
+        minCost: Number((performanceMetrics[0].minCost || 0).toFixed(6))
+      } : null,
+      timeRange,
+      generatedAt: new Date().toISOString()
+    });
+
+  } catch (err) {
+    console.error('Analytics overview error:', err);
+    next(err);
+  }
+};
+
+/**
+ * GET /api/admin/analytics/cost-forecast
+ * Generate cost forecasting based on historical data
+ */
+export const getCostForecast = async (req, res, next) => {
+  try {
+    const { days = 30 } = req.query;
+    const forecastDays = parseInt(days);
+    
+    // Get historical data for the last 30 days
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const historicalData = await prisma.summary.aggregateRaw({
+      pipeline: [
+        { $match: { 
+          status: 'completed',
+          createdAt: { $gte: thirtyDaysAgo }
+        }},
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: '%Y-%m-%d',
+                date: '$createdAt'
+              }
+            },
+            count: { $sum: 1 },
+            totalCost: { $sum: '$estimatedCost' }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]
+    });
+
+    // Calculate trends
+    const dailyCosts = Array.isArray(historicalData) ? historicalData : [];
+    const avgDailyCost = dailyCosts.length > 0 
+      ? dailyCosts.reduce((sum, day) => sum + (day.totalCost || 0), 0) / dailyCosts.length 
+      : 0;
+    
+    const avgDailyCount = dailyCosts.length > 0 
+      ? dailyCosts.reduce((sum, day) => sum + day.count, 0) / dailyCosts.length 
+      : 0;
+
+    // Simple linear regression for trend calculation
+    const recentDays = dailyCosts.slice(-7); // Last 7 days
+    const trend = recentDays.length > 1 ? 
+      (recentDays[recentDays.length - 1].totalCost - recentDays[0].totalCost) / recentDays.length : 0;
+
+    // Generate forecast
+    const forecast = [];
+    const today = new Date();
+    
+    for (let i = 1; i <= forecastDays; i++) {
+      const forecastDate = new Date(today);
+      forecastDate.setDate(today.getDate() + i);
+      
+      // Simple forecast: average + trend + some randomness for realism
+      const forecastCost = Math.max(0, avgDailyCost + (trend * i) + (Math.random() * 0.1 - 0.05) * avgDailyCost);
+      const forecastCount = Math.round(avgDailyCount + (Math.random() * 0.2 - 0.1) * avgDailyCount);
+      
+      forecast.push({
+        date: forecastDate.toISOString().split('T')[0],
+        estimatedCost: Number(forecastCost.toFixed(6)),
+        estimatedCount: forecastCount,
+        confidence: Math.max(0.5, 1 - (i / forecastDays) * 0.5) // Decreasing confidence over time
+      });
+    }
+
+    const totalForecastCost = forecast.reduce((sum, day) => sum + day.estimatedCost, 0);
+
+    return res.json({
+      historical: dailyCosts.map(day => ({
+        date: day._id,
+        actualCost: Number((day.totalCost || 0).toFixed(6)),
+        actualCount: day.count
+      })),
+      forecast,
+      summary: {
+        avgDailyCost: Number(avgDailyCost.toFixed(6)),
+        avgDailyCount: Math.round(avgDailyCount),
+        trend: trend > 0 ? 'increasing' : trend < 0 ? 'decreasing' : 'stable',
+        totalForecastCost: Number(totalForecastCost.toFixed(6)),
+        forecastPeriod: `${forecastDays} days`
+      }
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/admin/analytics/model-comparison
+ * Compare performance and costs across different models
+ */
+export const getModelComparison = async (req, res, next) => {
+  try {
+    const { timeRange = '30d' } = req.query;
+    
+    const now = new Date();
+    let startDate = new Date();
+    startDate.setDate(now.getDate() - (timeRange === '7d' ? 7 : timeRange === '90d' ? 90 : 30));
+
+    const modelComparison = await prisma.summary.aggregateRaw({
+      pipeline: [
+        { $match: { 
+          status: 'completed',
+          createdAt: { $gte: startDate }
+        }},
+        {
+          $group: {
+            _id: '$modelUsed',
+            count: { $sum: 1 },
+            totalCost: { $sum: '$estimatedCost' },
+            avgCost: { $avg: '$estimatedCost' },
+            totalPromptTokens: { $sum: '$promptTokens' },
+            totalResponseTokens: { $sum: '$responseTokens' },
+            avgPromptTokens: { $avg: '$promptTokens' },
+            avgResponseTokens: { $avg: '$responseTokens' },
+            minCost: { $min: '$estimatedCost' },
+            maxCost: { $max: '$estimatedCost' }
+          }
+        },
+        { $sort: { count: -1 } }
+      ]
+    });
+
+    const comparison = Array.isArray(modelComparison) ? modelComparison.map(model => {
+      const pricing = MODEL_PRICING[model._id] || MODEL_PRICING['default'];
+      
+      return {
+        model: model._id,
+        usage: {
+          count: model.count,
+          percentage: 0 // Will calculate after we have total
+        },
+        costs: {
+          total: Number((model.totalCost || 0).toFixed(6)),
+          average: Number((model.avgCost || 0).toFixed(6)),
+          min: Number((model.minCost || 0).toFixed(6)),
+          max: Number((model.maxCost || 0).toFixed(6))
+        },
+        tokens: {
+          totalPrompt: model.totalPromptTokens || 0,
+          totalResponse: model.totalResponseTokens || 0,
+          avgPrompt: Math.round(model.avgPromptTokens || 0),
+          avgResponse: Math.round(model.avgResponseTokens || 0),
+          total: (model.totalPromptTokens || 0) + (model.totalResponseTokens || 0)
+        },
+        pricing: {
+          promptCostPer1M: (pricing.promptTokenCost * 1000000).toFixed(2),
+          responseCostPer1M: (pricing.responseTokenCost * 1000000).toFixed(2)
+        },
+        efficiency: {
+          costPerToken: model.totalPromptTokens + model.totalResponseTokens > 0 
+            ? Number(((model.totalCost || 0) / ((model.totalPromptTokens || 0) + (model.totalResponseTokens || 0)) * 1000000).toFixed(6))
+            : 0
+        }
+      };
+    }) : [];
+
+    // Calculate usage percentages
+    const totalUsage = comparison.reduce((sum, model) => sum + model.usage.count, 0);
+    comparison.forEach(model => {
+      model.usage.percentage = totalUsage > 0 ? Number(((model.usage.count / totalUsage) * 100).toFixed(1)) : 0;
+    });
+
+    return res.json({
+      comparison,
+      summary: {
+        totalModelsUsed: comparison.length,
+        mostUsedModel: comparison[0]?.model || 'None',
+        totalCost: comparison.reduce((sum, model) => sum + model.costs.total, 0),
+        totalTokens: comparison.reduce((sum, model) => sum + model.tokens.total, 0)
+      },
+      timeRange
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/admin/analytics/export
+ * Export analytics data in various formats
+ */
+export const exportAnalytics = async (req, res, next) => {
+  try {
+    const { format = 'json', timeRange = '30d', type = 'overview' } = req.query;
+    
+    let data = {};
+    
+    switch (type) {
+      case 'overview':
+        const overviewReq = { query: { timeRange } };
+        const overviewRes = { json: (data) => { return data; } };
+        data = await getAnalyticsOverview(overviewReq, overviewRes, () => {});
+        break;
+      case 'model-comparison':
+        const modelReq = { query: { timeRange } };
+        const modelRes = { json: (data) => { return data; } };
+        data = await getModelComparison(modelReq, modelRes, () => {});
+        break;
+      default:
+        return res.status(400).json({ error: 'Invalid export type' });
+    }
+
+    if (format === 'csv') {
+      // Convert to CSV (simplified implementation)
+      const csv = convertToCSV(data);
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="analytics-${type}-${timeRange}.csv"`);
+      return res.send(csv);
+    }
+
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="analytics-${type}-${timeRange}.json"`);
+    return res.json(data);
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Helper function to convert data to CSV
+function convertToCSV(data) {
+  // Simplified CSV conversion - in a real app you'd use a proper CSV library
+  return JSON.stringify(data, null, 2);
+}
+
+==================================================
+// auth.controller.js
+==================================================
+
+// controllers/auth.controller.js
+
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import { PrismaClient } from '@prisma/client';
+import config from '../../config/default.js';
+import { sendPasswordResetEmail } from '../../utils/mailer.js';
+
+const prisma = new PrismaClient();
+
+const signup = async (req, res, next) => {
+  try {
+    const { email, password, role } = req.body;
+    if (!['Admin', 'Editor'].includes(role) && req.user?.role !== 'Admin') {
+      return res.status(403).json({ error: 'Invalid role or insufficient permissions' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = await prisma.user.create({
+      data: { email, passwordHash, role: role || 'Editor' },
+    });
+    res.status(201).json({ message: 'User created', userId: user.id });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const login = async (req, res, next) => {
+  try {
+    const { email, password } = req.body;
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const token = jwt.sign(
+      { userId: user.id, role: user.role },
+      config.JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+    res.json({ token, user: { id: user.id, email: user.email, role: user.role } });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const createEditor = async (req, res, next) => {
+  try {
+    const { email, password } = req.body;
+    const passwordHash = await bcrypt.hash(password, 10);
+    const editor = await prisma.user.create({
+      data: { email, passwordHash, role: 'Editor' },
+    });
+    res.status(201).json({ message: 'Editor created', userId: editor.id });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const deleteEditor = async (req, res, next) => {
+  try {
+    const { userId } = req.params;
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user || user.role !== 'Editor') {
+      return res.status(404).json({ error: 'Editor not found' });
+    }
+    await prisma.user.delete({ where: { id: userId } });
+    res.json({ message: 'Editor deleted' });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const listEditors = async (req, res, next) => {
+  try {
+    const editors = await prisma.user.findMany({
+      where: { role: 'Editor' },
+      select: { id: true, email: true, role: true },
+    });
+    res.json({ editors });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const me = async (req, res, next) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    const { id, email, role } = req.user;
+    res.json({ user: { id, email, role } });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/auth/forgot-password
+ * Public endpoint. Accepts { email }. Always returns 200 OK with generic message.
+ * If email belongs to an Editor, generate a short‐lived JWT reset token and send an email.
+ */
+const forgotPassword = async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    // Look up only Editors by email
+    const editor = await prisma.user.findFirst({
+      where: { email, role: 'Editor' },
+    });
+
+    if (editor) {
+      // 1) Generate a reset‐token (JWT) valid for a short time
+      const payload = { userId: editor.id, type: 'reset' };
+      const resetToken = jwt.sign(payload, config.JWT_RESET_SECRET, {
+        expiresIn: config.RESET_TOKEN_EXPIRY, // e.g. "1h"
+      });
+
+      // 2) Construct the reset link
+      const resetLink = `${config.FRONTEND_URL}/reset-password?token=${resetToken}`;
+
+      // 3) Send email
+      await sendPasswordResetEmail({ toEmail: editor.email, resetLink });
+      // Note: we do NOT send editor.email back to client; this is purely a private send.
+    }
+
+    // Always respond with 200 and a generic message so nobody can probe which emails exist
+    return res.json({
+      message:
+        'If an account with that email exists, you will receive a password reset link shortly.',
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/auth/reset-password
+ * Public endpoint. Accepts { token, password }.
+ * Verify token, check that user still exists & is an Editor, then update passwordHash.
+ */
+const resetPassword = async (req, res, next) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password) {
+      return res.status(400).json({ error: 'Token and new password are required' });
+    }
+
+    // 1) Verify the JWT
+    let payload;
+    try {
+      payload = jwt.verify(token, config.JWT_RESET_SECRET);
+    } catch (err) {
+      return res.status(400).json({ error: 'Invalid or expired token' });
+    }
+
+    // 2) Ensure token type is 'reset'
+    if (payload.type !== 'reset' || !payload.userId) {
+      return res.status(400).json({ error: 'Invalid token payload' });
+    }
+
+    // 3) Look up the user, ensure they are still an Editor
+    const user = await prisma.user.findUnique({ where: { id: payload.userId } });
+    if (!user || user.role !== 'Editor') {
+      return res.status(400).json({ error: 'Invalid token or user no longer an editor' });
+    }
+
+    // 4) Hash the new password and update
+    const passwordHash = await bcrypt.hash(password, 10);
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash },
+    });
+
+    res.json({ message: 'Password has been reset successfully. You can now log in.' });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export default {
+  signup,
+  login,
+  createEditor,
+  deleteEditor,
+  listEditors,
+  me,
+  forgotPassword,
+  resetPassword,
+};
+
+
+==================================================
+// role.controller.js
+==================================================
+
+// src/api/controllers/role.controller.js
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+/**
+ * GET /api/admin/roles/users
+ * Get all users with their roles and activity info
+ */
+export const getAllUsersWithRoles = async (req, res, next) => {
+  try {
+    const users = await prisma.user.findMany({
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        createdAt: true,
+      },
+      orderBy: {
+        createdAt: 'desc'
+      }
+    });
+
+    // Get summary counts for each user (to show activity)
+    const usersWithActivity = await Promise.all(
+      users.map(async (user) => {
+        // Count summaries created by looking at recent activity
+        // Since we don't have userId in Summary model, we'll use a different approach
+        // For now, we'll just return basic user info
+        return {
+          ...user,
+          totalSummaries: 0, // Placeholder - can be enhanced later
+          lastLogin: null,   // Placeholder - can be enhanced later
+          isActive: true,    // Placeholder - can be enhanced later
+        };
+      })
+    );
+
+    return res.json({
+      users: usersWithActivity,
+      totalUsers: users.length,
+      adminCount: users.filter(u => u.role === 'Admin').length,
+      editorCount: users.filter(u => u.role === 'Editor').length,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * PUT /api/admin/roles/users/:userId
+ * Update a user's role
+ */
+export const updateUserRole = async (req, res, next) => {
+  try {
+    const { userId } = req.params;
+    const { role } = req.body;
+    const adminUser = req.user; // Current admin user
+
+    // Validate role
+    if (!['Admin', 'Editor'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role. Must be Admin or Editor' });
+    }
+
+    // Check if user exists
+    const targetUser = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Prevent admin from demoting themselves
+    if (targetUser.id === adminUser.id && role !== 'Admin') {
+      return res.status(400).json({ 
+        error: 'You cannot change your own admin role' 
+      });
+    }
+
+    // Update the user's role
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: { role },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        createdAt: true,
+      }
+    });
+
+    console.log(`Admin ${adminUser.email} changed ${updatedUser.email}'s role to ${role}`);
+
+    return res.json({
+      message: `User role updated to ${role}`,
+      user: updatedUser
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/admin/roles/permissions
+ * Get current permission settings and role definitions
+ */
+export const getPermissions = async (req, res, next) => {
+  try {
+    // Define role permissions (this could be moved to a config file)
+    const rolePermissions = {
+      Admin: {
+        permissions: [
+          'view_dashboard',
+          'manage_users',
+          'manage_roles',
+          'view_analytics',
+          'export_data',
+          'system_settings',
+          'view_summaries',
+          'create_summaries',
+          'edit_summaries',
+          'delete_summaries',
+          'batch_processing'
+        ],
+        description: 'Full system access with user management capabilities'
+      },
+      Editor: {
+        permissions: [
+          'view_dashboard',
+          'view_summaries',
+          'create_summaries',
+          'edit_summaries',
+          'batch_processing'
+        ],
+        description: 'Content creation and editing capabilities'
+      }
+    };
+
+    // Get current user counts
+    const userCounts = await prisma.user.groupBy({
+      by: ['role'],
+      _count: true
+    });
+
+    const roleCounts = userCounts.reduce((acc, curr) => {
+      acc[curr.role] = curr._count;
+      return acc;
+    }, { Admin: 0, Editor: 0 });
+
+    return res.json({
+      rolePermissions,
+      roleCounts,
+      availablePermissions: [
+        'view_dashboard',
+        'manage_users',
+        'manage_roles',
+        'view_analytics',
+        'export_data',
+        'system_settings',
+        'view_summaries',
+        'create_summaries',
+        'edit_summaries',
+        'delete_summaries',
+        'batch_processing'
+      ]
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/admin/roles/activity
+ * Get user activity logs (basic implementation)
+ */
+export const getUserActivity = async (req, res, next) => {
+  try {
+    const { limit = 50, userId } = req.query;
+
+    // For now, we'll get summary creation activity
+    // In a full implementation, you'd have a separate audit log table
+    let whereClause = {};
+    if (userId) {
+      // This would need to be enhanced when we add userId tracking to summaries
+      whereClause = {}; // Placeholder
+    }
+
+    const recentSummaries = await prisma.summary.findMany({
+      where: {
+        status: 'completed',
+        ...whereClause
+      },
+      select: {
+        id: true,
+        title: true,
+        modelUsed: true,
+        createdAt: true,
+        estimatedCost: true,
+      },
+      orderBy: {
+        createdAt: 'desc'
+      },
+      take: parseInt(limit)
+    });
+
+    // Format as activity log
+    const activityLog = recentSummaries.map(summary => ({
+      id: summary.id,
+      action: 'summary_created',
+      description: `Created summary: ${summary.title || 'Untitled'}`,
+      model: summary.modelUsed,
+      cost: summary.estimatedCost,
+      timestamp: summary.createdAt,
+      userId: 'system', // Placeholder
+      userEmail: 'system', // Placeholder
+    }));
+
+    return res.json({
+      activities: activityLog,
+      totalCount: activityLog.length
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/admin/roles/bulk-update
+ * Bulk update multiple users' roles
+ */
+export const bulkUpdateRoles = async (req, res, next) => {
+  try {
+    const { userIds, role } = req.body;
+    const adminUser = req.user;
+
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ error: 'userIds must be a non-empty array' });
+    }
+
+    if (!['Admin', 'Editor'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+
+    // Prevent admin from changing their own role in bulk operation
+    if (userIds.includes(adminUser.id) && role !== 'Admin') {
+      return res.status(400).json({ 
+        error: 'Cannot change your own admin role in bulk operation' 
+      });
+    }
+
+    // Update all specified users
+    const updateResult = await prisma.user.updateMany({
+      where: {
+        id: { in: userIds },
+        id: { not: adminUser.id } // Extra safety to prevent self-role change
+      },
+      data: { role }
+    });
+
+    // Get updated users for response
+    const updatedUsers = await prisma.user.findMany({
+      where: { id: { in: userIds } },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+      }
+    });
+
+    console.log(`Admin ${adminUser.email} bulk updated ${updateResult.count} users to role ${role}`);
+
+    return res.json({
+      message: `Updated ${updateResult.count} users to ${role} role`,
+      updatedUsers,
+      count: updateResult.count
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+==================================================
+// export.controller.js
+==================================================
+
+// src/api/controllers/export.controller.js
+import { PrismaClient } from '@prisma/client';
+import fs from 'fs/promises';
+import path from 'path';
+import { createObjectCsvStringifier } from 'csv-writer';
+
+const prisma = new PrismaClient();
+
+// Create exports directory if it doesn't exist
+const EXPORTS_DIR = path.join(process.cwd(), 'exports');
+
+async function ensureExportsDir() {
+  try {
+    await fs.access(EXPORTS_DIR);
+  } catch {
+    await fs.mkdir(EXPORTS_DIR, { recursive: true });
+  }
+}
+
+/**
+ * GET /api/admin/export/options
+ * Get available export options and configurations
+ */
+export const getExportOptions = async (req, res, next) => {
+  try {
+    // Get data counts for each export type
+    const userCount = await prisma.user.count();
+    const summaryCount = await prisma.summary.count();
+    const completedSummaryCount = await prisma.summary.count({
+      where: { status: 'completed' }
+    });
+    const failedSummaryCount = await prisma.summary.count({
+      where: { status: 'failed' }
+    });
+
+    // Get date ranges
+    const oldestSummary = await prisma.summary.findFirst({
+      orderBy: { createdAt: 'asc' },
+      select: { createdAt: true }
+    });
+    
+    const newestSummary = await prisma.summary.findFirst({
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true }
+    });
+
+    // Available export types
+    const exportTypes = [
+      {
+        id: 'users',
+        name: 'Users',
+        description: 'Export all user accounts with roles and metadata',
+        count: userCount,
+        formats: ['json', 'csv'],
+        estimatedSize: `${Math.ceil(userCount * 0.5)}KB`
+      },
+      {
+        id: 'summaries',
+        name: 'All Summaries',
+        description: 'Export all article summaries with complete metadata',
+        count: summaryCount,
+        formats: ['json', 'csv'],
+        estimatedSize: `${Math.ceil(summaryCount * 2)}KB`
+      },
+      {
+        id: 'completed-summaries',
+        name: 'Completed Summaries',
+        description: 'Export only successfully completed summaries',
+        count: completedSummaryCount,
+        formats: ['json', 'csv', 'html'],
+        estimatedSize: `${Math.ceil(completedSummaryCount * 1.5)}KB`
+      },
+      {
+        id: 'failed-summaries',
+        name: 'Failed Summaries',
+        description: 'Export failed summaries for analysis',
+        count: failedSummaryCount,
+        formats: ['json', 'csv'],
+        estimatedSize: `${Math.ceil(failedSummaryCount * 1)}KB`
+      },
+      {
+        id: 'analytics',
+        name: 'Analytics Data',
+        description: 'Export aggregated analytics and cost data',
+        count: 1,
+        formats: ['json'],
+        estimatedSize: '50KB'
+      }
+    ];
+
+    return res.json({
+      exportTypes,
+      dateRange: {
+        earliest: oldestSummary?.createdAt || new Date(),
+        latest: newestSummary?.createdAt || new Date()
+      },
+      supportedFormats: ['json', 'csv', 'html'],
+      maxRecordsPerExport: 10000,
+      availableFilters: [
+        'dateRange',
+        'status',
+        'language',
+        'modelUsed',
+        'costThreshold'
+      ]
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/admin/export/generate
+ * Generate and download export file
+ */
+export const generateExport = async (req, res, next) => {
+  try {
+    const {
+      type,
+      format = 'json',
+      filters = {},
+      includeFields = [],
+      filename
+    } = req.body;
+
+    // Validate export type
+    const validTypes = ['users', 'summaries', 'completed-summaries', 'failed-summaries', 'analytics'];
+    if (!validTypes.includes(type)) {
+      return res.status(400).json({ error: 'Invalid export type' });
+    }
+
+    // Validate format
+    const validFormats = ['json', 'csv', 'html'];
+    if (!validFormats.includes(format)) {
+      return res.status(400).json({ error: 'Invalid export format' });
+    }
+
+    let data = [];
+    let exportFilename = filename || `${type}-${Date.now()}`;
+
+    // Generate data based on type
+    switch (type) {
+      case 'users':
+        data = await exportUsers(filters, includeFields);
+        break;
+      case 'summaries':
+        data = await exportSummaries({}, filters, includeFields);
+        break;
+      case 'completed-summaries':
+        data = await exportSummaries({ status: 'completed' }, filters, includeFields);
+        break;
+      case 'failed-summaries':
+        data = await exportSummaries({ status: 'failed' }, filters, includeFields);
+        break;
+      case 'analytics':
+        data = await exportAnalytics(filters);
+        break;
+      default:
+        return res.status(400).json({ error: 'Unsupported export type' });
+    }
+
+    // Apply additional filters
+    if (filters.limit) {
+      data = data.slice(0, parseInt(filters.limit));
+    }
+
+    // Format and send data
+    if (format === 'json') {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="${exportFilename}.json"`);
+      return res.json({
+        exportInfo: {
+          type,
+          generatedAt: new Date().toISOString(),
+          recordCount: data.length,
+          filters
+        },
+        data
+      });
+    } else if (format === 'csv') {
+      const csv = await convertToCSV(data, type);
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${exportFilename}.csv"`);
+      return res.send(csv);
+    } else if (format === 'html') {
+      const html = await convertToHTML(data, type);
+      res.setHeader('Content-Type', 'text/html');
+      res.setHeader('Content-Disposition', `attachment; filename="${exportFilename}.html"`);
+      return res.send(html);
+    }
+
+  } catch (err) {
+    console.error('Export generation error:', err);
+    next(err);
+  }
+};
+
+/**
+ * GET /api/admin/export/history
+ * Get export history and status
+ */
+export const getExportHistory = async (req, res, next) => {
+  try {
+    await ensureExportsDir();
+    
+    // In a real implementation, you'd store export jobs in the database
+    // For now, we'll return a mock history
+    const mockHistory = [
+      {
+        id: `export-${Date.now() - 86400000}`,
+        type: 'summaries',
+        format: 'csv',
+        status: 'completed',
+        recordCount: 1250,
+        fileSize: '2.5MB',
+        createdAt: new Date(Date.now() - 86400000).toISOString(),
+        completedAt: new Date(Date.now() - 86400000 + 30000).toISOString(),
+        createdBy: 'admin@example.com'
+      },
+      {
+        id: `export-${Date.now() - 172800000}`,
+        type: 'users',
+        format: 'json',
+        status: 'completed',
+        recordCount: 45,
+        fileSize: '15KB',
+        createdAt: new Date(Date.now() - 172800000).toISOString(),
+        completedAt: new Date(Date.now() - 172800000 + 5000).toISOString(),
+        createdBy: 'admin@example.com'
+      }
+    ];
+
+    return res.json({
+      history: mockHistory,
+      totalExports: mockHistory.length,
+      storageUsed: '2.515MB',
+      lastExport: mockHistory[0]
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/admin/export/schedule
+ * Schedule recurring exports (basic implementation)
+ */
+export const scheduleExport = async (req, res, next) => {
+  try {
+    const {
+      type,
+      format,
+      schedule, // 'daily', 'weekly', 'monthly'
+      filters = {},
+      enabled = true
+    } = req.body;
+
+    // In a real implementation, you'd store this in the database
+    // and set up actual cron jobs
+    const scheduledExport = {
+      id: `scheduled-${Date.now()}`,
+      type,
+      format,
+      schedule,
+      filters,
+      enabled,
+      createdAt: new Date().toISOString(),
+      nextRun: calculateNextRun(schedule),
+      createdBy: req.user.email
+    };
+
+    console.log('Scheduled export created:', scheduledExport);
+
+    return res.json({
+      message: 'Export scheduled successfully',
+      scheduledExport
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/admin/export/templates
+ * Get predefined export templates
+ */
+export const getExportTemplates = async (req, res, next) => {
+  try {
+    const templates = [
+      {
+        id: 'daily-summary-report',
+        name: 'Daily Summary Report',
+        description: 'Daily report of completed summaries with cost analysis',
+        type: 'completed-summaries',
+        format: 'csv',
+        filters: {
+          dateRange: 'last-24h'
+        },
+        includeFields: ['title', 'language', 'modelUsed', 'estimatedCost', 'createdAt']
+      },
+      {
+        id: 'weekly-analytics',
+        name: 'Weekly Analytics',
+        description: 'Comprehensive weekly analytics export',
+        type: 'analytics',
+        format: 'json',
+        filters: {
+          dateRange: 'last-7d'
+        }
+      },
+      {
+        id: 'monthly-cost-report',
+        name: 'Monthly Cost Report',
+        description: 'Monthly cost breakdown by model and language',
+        type: 'summaries',
+        format: 'csv',
+        filters: {
+          dateRange: 'last-30d',
+          status: 'completed'
+        },
+        includeFields: ['modelUsed', 'language', 'estimatedCost', 'promptTokens', 'responseTokens']
+      },
+      {
+        id: 'user-audit',
+        name: 'User Audit Export',
+        description: 'Complete user list for audit purposes',
+        type: 'users',
+        format: 'csv',
+        includeFields: ['email', 'role', 'createdAt']
+      }
+    ];
+
+    return res.json({ templates });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Helper functions
+async function exportUsers(filters = {}, includeFields = []) {
+  const defaultFields = {
+    id: true,
+    email: true,
+    role: true,
+    createdAt: true
+  };
+
+  const selectFields = includeFields.length > 0 
+    ? includeFields.reduce((acc, field) => ({ ...acc, [field]: true }), {})
+    : defaultFields;
+
+  return await prisma.user.findMany({
+    select: selectFields,
+    orderBy: { createdAt: 'desc' }
+  });
+}
+
+async function exportSummaries(baseFilters = {}, additionalFilters = {}, includeFields = []) {
+  const defaultFields = {
+    id: true,
+    articleId: true,
+    title: true,
+    language: true,
+    modelUsed: true,
+    promptTokens: true,
+    responseTokens: true,
+    status: true,
+    estimatedCost: true,
+    createdAt: true,
+    updatedAt: true
+  };
+
+  const selectFields = includeFields.length > 0 
+    ? includeFields.reduce((acc, field) => ({ ...acc, [field]: true }), {})
+    : defaultFields;
+
+  let whereClause = { ...baseFilters };
+
+  // Apply additional filters
+  if (additionalFilters.dateRange) {
+    const { start, end } = parseDateRange(additionalFilters.dateRange);
+    whereClause.createdAt = { gte: start, lte: end };
+  }
+
+  if (additionalFilters.language) {
+    whereClause.language = additionalFilters.language;
+  }
+
+  if (additionalFilters.modelUsed) {
+    whereClause.modelUsed = additionalFilters.modelUsed;
+  }
+
+  if (additionalFilters.costThreshold) {
+    whereClause.estimatedCost = { gte: parseFloat(additionalFilters.costThreshold) };
+  }
+
+  return await prisma.summary.findMany({
+    where: whereClause,
+    select: selectFields,
+    orderBy: { createdAt: 'desc' },
+    take: 10000 // Limit to prevent memory issues
+  });
+}
+
+async function exportAnalytics(filters = {}) {
+  // Get aggregated analytics data
+  const totalSummaries = await prisma.summary.count();
+  const completedSummaries = await prisma.summary.count({ where: { status: 'completed' } });
+  
+  const modelStats = await prisma.summary.aggregateRaw({
+    pipeline: [
+      { $match: { status: 'completed' } },
+      {
+        $group: {
+          _id: '$modelUsed',
+          count: { $sum: 1 },
+          totalCost: { $sum: '$estimatedCost' },
+          avgCost: { $avg: '$estimatedCost' }
+        }
+      },
+      { $sort: { count: -1 } }
+    ]
+  });
+
+  const languageStats = await prisma.summary.aggregateRaw({
+    pipeline: [
+      { $match: { status: 'completed' } },
+      {
+        $group: {
+          _id: '$language',
+          count: { $sum: 1 },
+          avgCost: { $avg: '$estimatedCost' }
+        }
+      },
+      { $sort: { count: -1 } }
+    ]
+  });
+
+  return {
+    overview: {
+      totalSummaries,
+      completedSummaries,
+      successRate: totalSummaries > 0 ? (completedSummaries / totalSummaries * 100) : 0
+    },
+    modelStats: Array.isArray(modelStats) ? modelStats : [],
+    languageStats: Array.isArray(languageStats) ? languageStats : [],
+    generatedAt: new Date().toISOString()
+  };
+}
+
+async function convertToCSV(data, type) {
+  if (!data || data.length === 0) {
+    return 'No data available';
+  }
+
+  // Get headers from first object
+  const headers = Object.keys(data[0]).map(key => ({ id: key, title: key }));
+  
+  // Convert data to CSV string
+  let csv = headers.map(h => h.title).join(',') + '\n';
+  
+  data.forEach(row => {
+    const values = headers.map(header => {
+      const value = row[header.id];
+      // Escape commas and quotes in CSV
+      if (typeof value === 'string' && (value.includes(',') || value.includes('"'))) {
+        return `"${value.replace(/"/g, '""')}"`;
+      }
+      return value || '';
+    });
+    csv += values.join(',') + '\n';
+  });
+
+  return csv;
+}
+
+async function convertToHTML(data, type) {
+  if (!data || data.length === 0) {
+    return '<html><body><h1>No data available</h1></body></html>';
+  }
+
+  const headers = Object.keys(data[0]);
+  
+  let html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Export: ${type}</title>
+      <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .summary { margin-bottom: 20px; padding: 10px; background-color: #f9f9f9; }
+      </style>
+    </head>
+    <body>
+      <div class="summary">
+        <h1>Export: ${type}</h1>
+        <p>Generated: ${new Date().toISOString()}</p>
+        <p>Records: ${data.length}</p>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            ${headers.map(h => `<th>${h}</th>`).join('')}
+          </tr>
+        </thead>
+        <tbody>
+          ${data.map(row => `
+            <tr>
+              ${headers.map(h => `<td>${row[h] || ''}</td>`).join('')}
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </body>
+    </html>
+  `;
+
+  return html;
+}
+
+function parseDateRange(range) {
+  const now = new Date();
+  let start = new Date();
+
+  switch (range) {
+    case 'last-24h':
+      start.setHours(now.getHours() - 24);
+      break;
+    case 'last-7d':
+      start.setDate(now.getDate() - 7);
+      break;
+    case 'last-30d':
+      start.setDate(now.getDate() - 30);
+      break;
+    default:
+      start.setDate(now.getDate() - 30);
+  }
+
+  return { start, end: now };
+}
+
+function calculateNextRun(schedule) {
+  const now = new Date();
+  const next = new Date(now);
+
+  switch (schedule) {
+    case 'daily':
+      next.setDate(now.getDate() + 1);
+      break;
+    case 'weekly':
+      next.setDate(now.getDate() + 7);
+      break;
+    case 'monthly':
+      next.setMonth(now.getMonth() + 1);
+      break;
+    default:
+      next.setDate(now.getDate() + 1);
+  }
+
+  return next.toISOString();
+}
+
+==================================================
+// systemSettings.controller.js
+==================================================
+
+// src/api/controllers/systemSettings.controller.js
+import { PrismaClient } from '@prisma/client';
+import { redisClient } from '../../utils/cache.js';
+import config from '../../config/default.js';
+import fs from 'fs/promises';
+import path from 'path';
+
+const prisma = new PrismaClient();
+
+// Current model configurations
+const MODEL_CONFIGS = {
+  'gpt-4.1-nano': {
+    maxTokens: 16000,
+    costPerPromptToken: 0.10 / 1000000,
+    costPerResponseToken: 0.40 / 1000000,
+    maxOutputTokens: 300,
+    priority: 1,
+    enabled: true
+  },
+  'gpt-4.1-mini': {
+    maxTokens: 128000,
+    costPerPromptToken: 0.40 / 1000000,
+    costPerResponseToken: 1.60 / 1000000,
+    maxOutputTokens: 500,
+    priority: 2,
+    enabled: true
+  },
+  'gpt-4o-mini': {
+    maxTokens: 128000,
+    costPerPromptToken: 0.15 / 1000000,
+    costPerResponseToken: 0.60 / 1000000,
+    maxOutputTokens: 500,
+    priority: 3,
+    enabled: true
+  },
+  'gpt-4o': {
+    maxTokens: 128000,
+    costPerPromptToken: 2.50 / 1000000,
+    costPerResponseToken: 10.00 / 1000000,
+    maxOutputTokens: 800,
+    priority: 4,
+    enabled: true
+  },
+  'gpt-4-turbo': {
+    maxTokens: 128000,
+    costPerPromptToken: 10.00 / 1000000,
+    costPerResponseToken: 30.00 / 1000000,
+    maxOutputTokens: 1000,
+    priority: 5,
+    enabled: true
+  }
+};
+
+/**
+ * GET /api/admin/system-settings
+ * Get all system settings and configurations
+ */
+export const getSystemSettings = async (req, res, next) => {
+  try {
+    // 1. Database connection status
+    let dbStatus = 'Connected';
+    let dbStats = {};
+    try {
+      // For MongoDB, we can't use $queryRaw, so we'll just do a simple operation
+      await prisma.user.count(); // This will test the connection
+      const userCount = await prisma.user.count();
+      const summaryCount = await prisma.summary.count();
+      dbStats = { userCount, summaryCount };
+    } catch (err) {
+      dbStatus = 'Error: ' + err.message;
+    }
+
+    // 2. Redis connection status
+    let redisStatus = 'Connected';
+    let redisStats = {};
+    try {
+      await redisClient.ping();
+      const redisInfo = await redisClient.info('memory');
+      redisStats = { 
+        status: 'healthy',
+        memory: redisInfo.includes('used_memory:') ? 
+          redisInfo.split('used_memory:')[1].split('\r\n')[0] : 'unknown'
+      };
+    } catch (err) {
+      redisStatus = 'Error: ' + err.message;
+    }
+
+    // 3. OpenAI API status
+    let openaiStatus = process.env.OPENAI_API_KEY ? 'Configured' : 'Not configured';
+
+    // 4. Rate limiting configuration
+    const rateLimitConfig = {
+      tokenHandshake: {
+        windowMs: 60 * 1000,
+        max: 10
+      },
+      summarization: {
+        windowMs: config.summarizeRateLimit?.windowMs || 3600000,
+        max: config.summarizeRateLimit?.max || 100
+      }
+    };
+
+    // 5. Cost management settings
+    const costSettings = {
+      maxCostPerArticle: parseFloat(process.env.MAX_COST_PER_ARTICLE || '0.10'),
+      maxCostPerBatch: parseFloat(process.env.MAX_COST_PER_BATCH || '5.00'),
+      autoSelectModel: process.env.MODEL_AUTO_SELECT !== 'false',
+      defaultModel: process.env.DEFAULT_MODEL || 'gpt-4.1-nano'
+    };
+
+    // 6. Email/SMTP configuration
+    const emailConfig = {
+      configured: !!(config.SMTP_HOST && config.SMTP_USER),
+      host: config.SMTP_HOST || '',
+      port: config.SMTP_PORT || 587,
+      secure: config.SMTP_PORT == 465,
+      user: config.SMTP_USER || '',
+      frontendUrl: config.FRONTEND_URL || ''
+    };
+
+    // 7. Security settings
+    const securitySettings = {
+      jwtConfigured: !!config.JWT_SECRET,
+      resetTokenExpiry: config.RESET_TOKEN_EXPIRY || '1h',
+      accessTokenTTL: config.accessTokenTTL || 300000,
+      corsOrigins: config.allowedOrigins || []
+    };
+
+    // 8. Model configurations
+    const modelSettings = {
+      configs: MODEL_CONFIGS,
+      currentStrategy: process.env.MODEL_STRATEGY || 'COST_OPTIMIZED',
+      dynamicSwitching: process.env.DYNAMIC_MODEL_SWITCHING !== 'false',
+      fallbackModel: process.env.FALLBACK_MODEL || 'gpt-4.1-nano'
+    };
+
+    // 9. System performance stats
+    const performanceStats = {
+      uptime: process.uptime(),
+      memoryUsage: process.memoryUsage(),
+      nodeVersion: process.version,
+      platform: process.platform
+    };
+
+    return res.json({
+      database: { status: dbStatus, stats: dbStats },
+      redis: { status: redisStatus, stats: redisStats },
+      openai: { status: openaiStatus },
+      rateLimiting: rateLimitConfig,
+      costManagement: costSettings,
+      email: emailConfig,
+      security: securitySettings,
+      models: modelSettings,
+      performance: performanceStats,
+      environment: process.env.NODE_ENV || 'development'
+    });
+
+  } catch (err) {
+    console.error('System settings error:', err);
+    next(err);
+  }
+};
+
+/**
+ * PUT /api/admin/system-settings/rate-limits
+ * Update rate limiting settings
+ */
+export const updateRateLimits = async (req, res, next) => {
+  try {
+    const { tokenHandshake, summarization } = req.body;
+
+    // Validate input
+    if (tokenHandshake) {
+      if (tokenHandshake.windowMs < 1000 || tokenHandshake.max < 1) {
+        return res.status(400).json({ error: 'Invalid token handshake rate limits' });
+      }
+    }
+    
+    if (summarization) {
+      if (summarization.windowMs < 60000 || summarization.max < 1) {
+        return res.status(400).json({ error: 'Invalid summarization rate limits' });
+      }
+    }
+
+    // In a full implementation, you would save these to a configuration store
+    // For now, we'll just validate and return success
+    console.log('Rate limits update requested:', { tokenHandshake, summarization });
+
+    return res.json({
+      message: 'Rate limits updated successfully',
+      updatedSettings: { tokenHandshake, summarization }
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * PUT /api/admin/system-settings/cost-management
+ * Update cost management settings
+ */
+export const updateCostSettings = async (req, res, next) => {
+  try {
+    const { maxCostPerArticle, maxCostPerBatch, autoSelectModel, defaultModel } = req.body;
+
+    // Validate input
+    if (maxCostPerArticle !== undefined && (maxCostPerArticle < 0 || maxCostPerArticle > 100)) {
+      return res.status(400).json({ error: 'Invalid max cost per article (0-100)' });
+    }
+
+    if (maxCostPerBatch !== undefined && (maxCostPerBatch < 0 || maxCostPerBatch > 1000)) {
+      return res.status(400).json({ error: 'Invalid max cost per batch (0-1000)' });
+    }
+
+    if (defaultModel && !MODEL_CONFIGS[defaultModel]) {
+      return res.status(400).json({ error: 'Invalid default model' });
+    }
+
+    // In a production app, you would update environment variables or a config store
+    console.log('Cost settings update requested:', { 
+      maxCostPerArticle, 
+      maxCostPerBatch, 
+      autoSelectModel, 
+      defaultModel 
+    });
+
+    return res.json({
+      message: 'Cost settings updated successfully',
+      updatedSettings: { maxCostPerArticle, maxCostPerBatch, autoSelectModel, defaultModel }
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * PUT /api/admin/system-settings/models
+ * Update model configurations
+ */
+export const updateModelConfig = async (req, res, next) => {
+  try {
+    const { modelName, config: modelConfig } = req.body;
+
+    if (!modelName || !MODEL_CONFIGS[modelName]) {
+      return res.status(400).json({ error: 'Invalid model name' });
+    }
+
+    // Validate model configuration
+    const requiredFields = ['maxTokens', 'costPerPromptToken', 'costPerResponseToken', 'maxOutputTokens'];
+    for (const field of requiredFields) {
+      if (modelConfig[field] === undefined || modelConfig[field] < 0) {
+        return res.status(400).json({ error: `Invalid ${field}` });
+      }
+    }
+
+    // Update model configuration (in memory for this demo)
+    MODEL_CONFIGS[modelName] = { ...MODEL_CONFIGS[modelName], ...modelConfig };
+
+    console.log('Model configuration updated:', modelName, modelConfig);
+
+    return res.json({
+      message: `Model ${modelName} configuration updated successfully`,
+      updatedModel: MODEL_CONFIGS[modelName]
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/admin/system-settings/test-connection
+ * Test various system connections
+ */
+export const testConnections = async (req, res, next) => {
+  try {
+    const { service } = req.body; // 'database', 'redis', 'openai', 'email'
+    const results = {};
+
+    if (!service || service === 'database') {
+      try {
+        // Test MongoDB connection by doing a simple count operation
+        await prisma.user.count();
+        results.database = { status: 'success', message: 'MongoDB connection successful' };
+      } catch (err) {
+        results.database = { status: 'error', message: err.message };
+      }
+    }
+
+    if (!service || service === 'redis') {
+      try {
+        const result = await redisClient.ping();
+        results.redis = { status: 'success', message: `Redis connection successful: ${result}` };
+      } catch (err) {
+        results.redis = { status: 'error', message: err.message };
+      }
+    }
+
+    if (!service || service === 'openai') {
+      try {
+        if (!process.env.OPENAI_API_KEY) {
+          results.openai = { status: 'error', message: 'OpenAI API key not configured' };
+        } else {
+          // In a real implementation, you might make a test API call
+          results.openai = { status: 'success', message: 'OpenAI API key is configured' };
+        }
+      } catch (err) {
+        results.openai = { status: 'error', message: err.message };
+      }
+    }
+
+    return res.json({
+      message: 'Connection tests completed',
+      results
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/admin/system-settings/clear-cache
+ * Clear Redis cache
+ */
+export const clearCache = async (req, res, next) => {
+  try {
+    const { pattern } = req.body; // Optional pattern to clear specific keys
+
+    let deletedKeys = 0;
+    if (pattern) {
+      const keys = await redisClient.keys(pattern);
+      if (keys.length > 0) {
+        deletedKeys = await redisClient.del(...keys);
+      }
+    } else {
+      await redisClient.flushAll();
+      deletedKeys = 'all';
+    }
+
+    console.log(`Cache cleared: ${deletedKeys} keys deleted`);
+
+    return res.json({
+      message: 'Cache cleared successfully',
+      deletedKeys
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/admin/system-settings/logs
+ * Get recent system logs (basic implementation)
+ */
+export const getSystemLogs = async (req, res, next) => {
+  try {
+    const { limit = 100, level = 'all' } = req.query;
+
+    // For MongoDB, we'll get recent database activity as "logs"
+    const recentActivity = await prisma.summary.findMany({
+      take: parseInt(limit),
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        status: true,
+        modelUsed: true,
+        createdAt: true,
+        errorMsg: true,
+        title: true
+      }
+    });
+
+    const logs = recentActivity.map(activity => ({
+      timestamp: activity.createdAt,
+      level: activity.status === 'failed' ? 'error' : 'info',
+      message: activity.status === 'failed' 
+        ? `Summary failed: ${activity.errorMsg || 'Unknown error'}` 
+        : `Summary completed: ${activity.title || 'Untitled'} using ${activity.modelUsed}`,
+      service: 'summarizer',
+      details: {
+        id: activity.id,
+        status: activity.status,
+        model: activity.modelUsed
+      }
+    }));
+
+    const filteredLogs = level === 'all' ? logs : logs.filter(log => log.level === level);
+
+    return res.json({
+      logs: filteredLogs,
+      totalCount: filteredLogs.length,
+      availableLevels: ['all', 'info', 'error']
+    });
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+==================================================
+// summarize.controller.js
+==================================================
+
+import { getCache, setCache }      from '../../utils/cache.js';
+import contentFetcher               from '../../services/contentFetcher.js';
+import languageDetector             from '../../services/languageDetector.js';
+import summarizer                   from '../../services/summarizer.js';
+import { PrismaClient }             from '@prisma/client';
+const prisma = new PrismaClient();
+
+const summarize = async (req, res, next) => {
+  try {
+    const {
+      articleId,      // may be number or undefined
+      url,            // may be string or undefined
+      title: bodyTitle,
+      text:  bodyText,
+      model,          // NEW: optional preferred model
+      autoSelectModel = true  // NEW: whether to auto-select optimal model
+    } = req.body;
+
+    // 1️⃣ Build a single string key from either articleId or url:
+    const idStr = articleId != null 
+      ? String(articleId) 
+      : url;   // if url is also undefined, we'll catch it below
+
+    if (!idStr) {
+      res.status(400);
+      throw new Error('Either articleId or url must be provided');
+    }
+
+    // 2️⃣ Check cache first - but only if not requesting a specific model
+    const cacheKey = `summary:${idStr}${model ? `:${model}` : ''}`;
+    if (!model || !autoSelectModel) {
+      const cached = await getCache(cacheKey);
+      if (cached) {
+        return res.json({ summary_html: cached, cached: true });
+      }
+    }
+
+    // 3️⃣ Fetch or reuse provided text
+    let title, text;
+    if (bodyTitle && bodyText) {
+      title = bodyTitle;
+      text  = bodyText;
+    } else {
+      ({ title, text } = await contentFetcher.fetch(url));
+    }
+
+    // 4️⃣ Detect language
+    const language = languageDetector.detect(text);
+    console.log(`🌐 Language detected: ${language} for content: "${title}"`);
+
+    // 5️⃣ Model selection logic
+    let selectedModel = model;
+    let modelSelectionReason = 'manual';
+
+    if (autoSelectModel && !model) {
+      // Auto-select the most cost-effective model
+      try {
+        const costEstimates = Object.keys(summarizer.MODEL_CONFIGS).map(modelName => {
+          try {
+            return summarizer.estimateCost(title, text, language, modelName);
+          } catch (err) {
+            return null;
+          }
+        }).filter(Boolean);
+
+        const affordableModels = costEstimates
+          .filter(est => est.canHandle)
+          .sort((a, b) => a.estimatedCost - b.estimatedCost);
+
+        if (affordableModels.length > 0) {
+          selectedModel = affordableModels[0].modelName;
+          modelSelectionReason = 'auto_optimal';
+          console.log(`🎯 Auto-selected model: ${selectedModel} (estimated cost: $${affordableModels[0].estimatedCost.toFixed(6)})`);
+        } else {
+          throw new Error('Content too large for any available model');
+        }
+      } catch (err) {
+        console.error('Model auto-selection failed:', err.message);
+        selectedModel = 'gpt-4.1-nano'; // Fallback
+        modelSelectionReason = 'fallback';
+      }
+    } else if (model) {
+      // Validate the requested model
+      if (!summarizer.MODEL_CONFIGS[model]) {
+        res.status(400);
+        throw new Error(`Invalid model: ${model}. Available models: ${Object.keys(summarizer.MODEL_CONFIGS).join(', ')}`);
+      }
+      modelSelectionReason = 'requested';
+    } else {
+      selectedModel = 'gpt-4.1-nano'; // Default
+      modelSelectionReason = 'default';
+    }
+
+    // 6️⃣ Summarize with selected/auto-selected model
+    const summaryResult = await summarizer.summarize({
+      title,
+      text,
+      language,
+      model: selectedModel
+    });
+
+    const { 
+      html, 
+      modelUsed, 
+      promptTokens, 
+      responseTokens,
+      estimatedCost,
+      modelSelectionReason: actualSelectionReason,
+      wasTruncated
+    } = summaryResult;
+
+    console.log(`✅ Summary generated using ${modelUsed} (cost: ${(estimatedCost || 0).toFixed(6)})`);
+    if (wasTruncated) {
+      console.log(`⚠️ Content was truncated due to size limitations`);
+    }
+
+    // 7️⃣ Upsert via Prisma using the single idStr
+    const existing = await prisma.summary.findUnique({
+      where: { articleId: idStr }
+    });
+
+    const summaryData = {
+      title,
+      language,
+      summaryHtml: html,
+      modelUsed,
+      promptTokens,
+      responseTokens,
+      status: 'completed',
+      // Store additional metadata
+      estimatedCost: estimatedCost || 0,
+      modelSelectionReason: actualSelectionReason || modelSelectionReason,
+      wasTruncated: wasTruncated || false
+    };
+
+    if (existing) {
+      await prisma.summary.update({
+        where: { articleId: idStr },
+        data: summaryData,
+      });
+    } else {
+      await prisma.summary.create({
+        data: {
+          articleId: idStr,
+          ...summaryData,
+        },
+      });
+    }
+
+    // 8️⃣ Cache and return (with model-specific cache key)
+    await setCache(cacheKey, html, 60 * 60 * 24);
+    
+    res.json({ 
+      summary_html: html, 
+      cached: false,
+      metadata: {
+        modelUsed,
+        language,
+        estimatedCost: estimatedCost || 0,
+        modelSelectionReason: actualSelectionReason || modelSelectionReason,
+        wasTruncated: wasTruncated || false,
+        promptTokens,
+        responseTokens
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export default { summarize };
+
+==================================================
+// admin.controller.js
+==================================================
+
+// src/api/controllers/admin.controller.js (MongoDB Compatible)
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+// Updated pricing based on the latest OpenAI pricing (per 1M tokens)
+const MODEL_PRICING = {
+  'gpt-4.1-nano': {
+    promptTokenCost: 0.10 / 1000000,   // $0.10 per 1M tokens
+    responseTokenCost: 0.40 / 1000000  // $0.40 per 1M tokens
+  },
+  'gpt-4.1-mini': {
+    promptTokenCost: 0.40 / 1000000,   
+    responseTokenCost: 1.60 / 1000000  
+  },
+  'gpt-4.1': {
+    promptTokenCost: 2.00 / 1000000,   
+    responseTokenCost: 8.00 / 1000000  
+  },
+  'gpt-4o-mini': {
+    promptTokenCost: 0.15 / 1000000,   
+    responseTokenCost: 0.60 / 1000000  
+  },
+  'gpt-4o': {
+    promptTokenCost: 2.50 / 1000000,   
+    responseTokenCost: 10.00 / 1000000 
+  },
+  'gpt-4-turbo': {
+    promptTokenCost: 10.00 / 1000000,  
+    responseTokenCost: 30.00 / 1000000 
+  },
+  // Fallback for unknown models
+  'default': {
+    promptTokenCost: 0.10 / 1000000,
+    responseTokenCost: 0.40 / 1000000
+  }
+};
+
+/**
+ * Calculate cost for a summary based on the model used
+ */
+function calculateSummaryCost(promptTokens, responseTokens, modelUsed) {
+  const pricing = MODEL_PRICING[modelUsed] || MODEL_PRICING['default'];
+  return (promptTokens * pricing.promptTokenCost) + (responseTokens * pricing.responseTokenCost);
+}
+
+export async function getDashboardStats(req, res, next) {
+  try {
+    // 1) Total number of articles successfully summarized
+    const totalArticles = await prisma.summary.count({
+      where: { status: 'completed' },
+    });
+
+    // 2) Total number of API calls made
+    const totalApiCalls = await prisma.summary.count();
+
+    // 3) Get all completed summaries with token data
+    const completedSummaries = await prisma.summary.findMany({
+      where: { status: 'completed' },
+      select: {
+        promptTokens: true,
+        responseTokens: true,
+        modelUsed: true,
+        estimatedCost: true,
+      },
+    });
+
+    // 4) Calculate total cost using correct pricing
+    let totalCost = 0;
+    const modelUsageStats = {};
+
+    completedSummaries.forEach((summary) => {
+      const { promptTokens, responseTokens, modelUsed, estimatedCost } = summary;
+      
+      // Use stored estimatedCost if available, otherwise calculate
+      let cost = 0;
+      if (estimatedCost && estimatedCost > 0) {
+        cost = estimatedCost;
+      } else {
+        cost = calculateSummaryCost(promptTokens || 0, responseTokens || 0, modelUsed);
+      }
+      
+      totalCost += cost;
+      
+      // Track model usage
+      if (!modelUsageStats[modelUsed]) {
+        modelUsageStats[modelUsed] = { count: 0, totalCost: 0, totalTokens: 0 };
+      }
+      modelUsageStats[modelUsed].count++;
+      modelUsageStats[modelUsed].totalCost += cost;
+      modelUsageStats[modelUsed].totalTokens += (promptTokens || 0) + (responseTokens || 0);
+    });
+
+    // 5) Aggregate token sums for average calculation
+    const totals = await prisma.summary.aggregate({
+      where: { status: 'completed' },
+      _sum: {
+        promptTokens: true,
+        responseTokens: true,
+      },
+    });
+
+    const sumPrompt = totals._sum.promptTokens ?? 0;
+    const sumResponse = totals._sum.responseTokens ?? 0;
+
+    // 6) Daily counts of completed articles (MongoDB aggregation)
+    const dailyResults = await prisma.summary.aggregateRaw({
+      pipeline: [
+        { $match: { status: 'completed' } },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: '%Y-%m-%d',
+                date: '$createdAt'
+              }
+            },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { _id: 1 } },
+        {
+          $project: {
+            date: '$_id',
+            count: 1,
+            _id: 0
+          }
+        }
+      ]
+    });
+
+    const dailySummaries = Array.isArray(dailyResults) 
+      ? dailyResults.map(item => ({
+          date: item.date,
+          count: item.count
+        }))
+      : [];
+
+    // 7) Average tokens per API call
+    const totalTokensSoFar = sumPrompt + sumResponse;
+    const avgTokens = totalApiCalls > 0 ? totalTokensSoFar / totalApiCalls : 0;
+
+    // 8) Success rate (%) = (completed / total) * 100
+    const successRate = totalApiCalls > 0 ? (totalArticles / totalApiCalls) * 100 : 0;
+
+    // 9) Top 5 languages by usage (MongoDB aggregation)
+    const topLangResults = await prisma.summary.aggregateRaw({
+      pipeline: [
+        { $match: { status: 'completed' } },
+        {
+          $group: {
+            _id: '$language',
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { count: -1 } },
+        { $limit: 5 },
+        {
+          $project: {
+            language: '$_id',
+            count: 1,
+            _id: 0
+          }
+        }
+      ]
+    });
+
+    const topLanguages = Array.isArray(topLangResults)
+      ? topLangResults.map((item) => ({
+          language: item.language || 'Unknown',
+          count: item.count,
+        }))
+      : [];
+
+    // 10) Recent summaries (last 5 entries)
+    const recentRecords = await prisma.summary.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 5,
+      select: {
+        id: true,
+        articleId: true,
+        title: true,
+        status: true,
+        createdAt: true,
+        modelUsed: true,
+        estimatedCost: true,
+        promptTokens: true,
+        responseTokens: true,
+      },
+    });
+
+    const recentSummaries = recentRecords.map((rec) => {
+      const cost = rec.estimatedCost || calculateSummaryCost(rec.promptTokens || 0, rec.responseTokens || 0, rec.modelUsed);
+      return {
+        articleId: rec.articleId ?? rec.id,
+        title: rec.title || 'Untitled',
+        status: rec.status,
+        createdAt: rec.createdAt ? rec.createdAt.toISOString() : new Date(0).toISOString(),
+        modelUsed: rec.modelUsed || 'unknown',
+        cost: Number(cost.toFixed(6)),
+      };
+    });
+
+    // 11) Cost breakdown by model
+    const costBreakdown = Object.entries(modelUsageStats).map(([model, stats]) => ({
+      model,
+      count: stats.count,
+      totalCost: Number(stats.totalCost.toFixed(6)),
+      avgCost: Number((stats.totalCost / stats.count).toFixed(6)),
+      totalTokens: stats.totalTokens,
+    }));
+
+    // 12) Return enhanced stats
+    return res.json({
+      totalArticles,
+      totalApiCalls,
+      totalCost: Number(totalCost.toFixed(6)),
+      dailySummaries,
+      avgTokens: Number(avgTokens.toFixed(0)),
+      successRate: Number(successRate.toFixed(2)),
+      topLanguages,
+      recentSummaries,
+      
+      // Enhanced data
+      modelUsageStats: costBreakdown,
+      avgCostPerArticle: totalArticles > 0 ? Number((totalCost / totalArticles).toFixed(6)) : 0,
+      totalPromptTokens: sumPrompt,
+      totalResponseTokens: sumResponse,
+      totalTokens: sumPrompt + sumResponse,
+      
+      // Pricing info for reference
+      currentPricing: MODEL_PRICING,
+    });
+  } catch (err) {
+    console.error('Dashboard stats error:', err);
+    next(err);
+  }
+}
+
+/**
+ * Get detailed cost analysis
+ */
+export async function getCostAnalysis(req, res, next) {
+  try {
+    const { startDate, endDate, model } = req.query;
+    
+    let whereClause = { status: 'completed' };
+    
+    if (startDate || endDate) {
+      whereClause.createdAt = {};
+      if (startDate) whereClause.createdAt.gte = new Date(startDate);
+      if (endDate) whereClause.createdAt.lte = new Date(endDate);
+    }
+    
+    if (model && model !== 'all') {
+      whereClause.modelUsed = model;
+    }
+
+    const summaries = await prisma.summary.findMany({
+      where: whereClause,
+      select: {
+        id: true,
+        articleId: true,
+        title: true,
+        modelUsed: true,
+        promptTokens: true,
+        responseTokens: true,
+        estimatedCost: true,
+        createdAt: true,
+        language: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    // Calculate costs with correct pricing
+    const detailedAnalysis = summaries.map(summary => {
+      const cost = summary.estimatedCost && summary.estimatedCost > 0 
+        ? summary.estimatedCost
+        : calculateSummaryCost(summary.promptTokens || 0, summary.responseTokens || 0, summary.modelUsed);
+      
+      return {
+        ...summary,
+        actualCost: Number(cost.toFixed(6)),
+        totalTokens: (summary.promptTokens || 0) + (summary.responseTokens || 0),
+      };
+    });
+
+    const totalCost = detailedAnalysis.reduce((sum, item) => sum + item.actualCost, 0);
+
+    return res.json({
+      summaries: detailedAnalysis,
+      totalCost: Number(totalCost.toFixed(6)),
+      totalItems: detailedAnalysis.length,
+      avgCost: detailedAnalysis.length > 0 ? Number((totalCost / detailedAnalysis.length).toFixed(6)) : 0,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * Get system settings and configuration
+ */
+export async function getSystemSettings(req, res, next) {
+  try {
+    // MongoDB aggregation for model statistics
+    const modelStats = await prisma.summary.aggregateRaw({
+      pipeline: [
+        { $match: { status: 'completed' } },
+        {
+          $group: {
+            _id: '$modelUsed',
+            usage_count: { $sum: 1 },
+            avg_prompt_tokens: { $avg: '$promptTokens' },
+            avg_response_tokens: { $avg: '$responseTokens' }
+          }
+        },
+        { $sort: { usage_count: -1 } },
+        {
+          $project: {
+            modelUsed: '$_id',
+            usage_count: 1,
+            avg_prompt_tokens: 1,
+            avg_response_tokens: 1,
+            _id: 0
+          }
+        }
+      ]
+    });
+
+    return res.json({
+      currentPricing: MODEL_PRICING,
+      modelStats: Array.isArray(modelStats) ? modelStats.map(stat => ({
+        model: stat.modelUsed,
+        usageCount: Number(stat.usage_count),
+        avgPromptTokens: Number(stat.avg_prompt_tokens || 0),
+        avgResponseTokens: Number(stat.avg_response_tokens || 0),
+      })) : [],
+      systemInfo: {
+        database: process.env.DATABASE_URL ? 'Connected (MongoDB)' : 'Not configured',
+        redis: process.env.REDIS_URL ? 'Connected' : 'Not configured',
+        openai: process.env.OPENAI_API_KEY ? 'Configured' : 'Not configured',
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+==================================================
+// auth.routes.js
+==================================================
+
+// routes/auth.routes.js
+
+import { Router } from 'express';
+import authController from '../controllers/auth.controller.js';
+import { authMiddleware, requireRole } from '../middleware/auth.middleware.js';
+
+const router = Router();
+
+// Anyone with a valid token can GET /me
+router.get('/me', authMiddleware, authController.me);
+
+router.post('/login', authController.login);
+
+// Only Admins can create new Users/Editors
+router.post('/signup', authMiddleware, requireRole(['Admin']), authController.signup);
+router.get(
+  '/editors',
+  authMiddleware,
+  requireRole(['Admin']),
+  authController.listEditors
+);
+router.post(
+  '/editors',
+  authMiddleware,
+  requireRole(['Admin']),
+  authController.createEditor
+);
+router.delete(
+  '/editors/:userId',
+  authMiddleware,
+  requireRole(['Admin']),
+  authController.deleteEditor
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Public password‐reset endpoints (NO authMiddleware)
+// ──────────────────────────────────────────────────────────────────────────
+
+// 1) Forgot Password: user submits their email
+router.post('/forgot-password', authController.forgotPassword);
+
+// 2) Reset Password: user submits { token, password }
+router.post('/reset-password', authController.resetPassword);
+
+export default router;
+
+
+==================================================
+// editor.routes.js
+==================================================
+
+// routes/editor.routes.js
+
+import { Router } from 'express';
+import {
+  listSummaries,
+  getSummary,
+  updateSummary,
+} from '../controllers/editor.controller.js';
+import { 
+  runBatchSummaries,
+  getAvailableModels,
+  estimateProcessingCost
+} from '../controllers/editor.batch.controller.js'; 
+
+import { authMiddleware, requireRole } from '../middleware/auth.middleware.js';
+
+const router = Router();
+
+// All editor routes require authentication AND role = Editor or Admin
+router.use(authMiddleware, requireRole(['Editor', 'Admin']));
+
+// 1) List all summaries
+router.get('/summaries', listSummaries);
+
+// 2) Get one summary by ID
+router.get('/summaries/:id', getSummary);
+
+// 3) Update a summary
+router.put('/summaries/:id', updateSummary);
+
+// 4) Batch processing with model selection
+router.post('/summaries/batch', runBatchSummaries);
+
+// 5) Get available models and their capabilities
+router.get('/models', getAvailableModels);
+
+// 6) Estimate processing cost for content
+router.post('/estimate-cost', estimateProcessingCost);
+
+export default router;
+
+==================================================
+// summarize.routes.js
+==================================================
+
+import { Router } from 'express';
+import summarizeController from '../controllers/summarize.controller.js';
+
+const router = Router();
+
+router.post('/', summarizeController.summarize);
+
+export default router;
+
+
+==================================================
+// admin.routes.js
+==================================================
+
+// src/api/routes/admin.routes.js
+import { Router } from 'express';
+import { 
+  getDashboardStats, 
+  getCostAnalysis,
+  getSystemSettings as getAdminSystemSettings
+} from '../controllers/admin.controller.js';
+import {
+  getAllUsersWithRoles,
+  updateUserRole,
+  getPermissions,
+  getUserActivity,
+  bulkUpdateRoles
+} from '../controllers/role.controller.js';
+import {
+  getSystemSettings,
+  updateRateLimits,
+  updateCostSettings,
+  updateModelConfig,
+  testConnections,
+  clearCache,
+  getSystemLogs
+} from '../controllers/systemSettings.controller.js';
+import {
+  getAnalyticsOverview,
+  getCostForecast,
+  getModelComparison,
+  exportAnalytics
+} from '../controllers/analytics.controller.js';
+import {
+  getExportOptions,
+  generateExport,
+  getExportHistory,
+  scheduleExport,
+  getExportTemplates
+} from '../controllers/export.controller.js';
+
+const router = Router();
+
+// Dashboard and analytics routes
+router.get('/dashboard', getDashboardStats);
+router.get('/cost-analysis', getCostAnalysis);
+
+// Role and permission management routes
+router.get('/roles/users', getAllUsersWithRoles);
+router.put('/roles/users/:userId', updateUserRole);
+router.get('/roles/permissions', getPermissions);
+router.get('/roles/activity', getUserActivity);
+router.post('/roles/bulk-update', bulkUpdateRoles);
+
+// System settings routes
+router.get('/system-settings', getSystemSettings);
+router.put('/system-settings/rate-limits', updateRateLimits);
+router.put('/system-settings/cost-management', updateCostSettings);
+router.put('/system-settings/models', updateModelConfig);
+router.post('/system-settings/test-connection', testConnections);
+router.post('/system-settings/clear-cache', clearCache);
+router.get('/system-settings/logs', getSystemLogs);
+
+// Advanced analytics routes
+router.get('/analytics/overview', getAnalyticsOverview);
+router.get('/analytics/cost-forecast', getCostForecast);
+router.get('/analytics/model-comparison', getModelComparison);
+router.get('/analytics/export', exportAnalytics);
+
+// Export data routes
+router.get('/export/options', getExportOptions);
+router.post('/export/generate', generateExport);
+router.get('/export/history', getExportHistory);
+router.post('/export/schedule', scheduleExport);
+router.get('/export/templates', getExportTemplates);
+
+export default router;
+
+==================================================
+// summaryWorker.js
+==================================================
+
+/ src/workers/summaryWorker.js
+import { Worker } from 'bullmq';
+import { summaryQueue } from '../utils/queue.js';
+import contentFetcher from '../services/contentFetcher.js';
+import languageDetector from '../services/languageDetector.js';
+import summarizer from '../services/summarizer.js';
+import { setCache } from '../utils/cache.js';
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
+
+new Worker('summary', async job => {
+  const { articleId, url } = job.data;
+  const key = `summary:${articleId || url}`;
+  try {
+    const { title, text } = await contentFetcher.fetch(url);
+    const language = languageDetector.detect(text);
+    const { html: summaryHtml, modelUsed, promptTokens, responseTokens } =
+      await summarizer.summarize({ title, text, language });
+
+    const existing = await prisma.summary.findUnique({ where: { articleId } });
+    if (existing) {
+      await prisma.summary.update({
+        where: { articleId },
+        data: { title, language, summaryHtml, modelUsed, promptTokens, responseTokens, status: 'completed' }
+      });
+    } else {
+      await prisma.summary.create({
+        data: { articleId, title, language, summaryHtml, modelUsed, promptTokens, responseTokens, status: 'completed' }
+      });
+    }
+
+    await setCache(key, summaryHtml, 60 * 60 * 24);
+  } catch (err) {
+    console.error('Worker error:', err);
+    await prisma.summary.update({
+      where: { articleId },
+      data: { status: 'failed', errorMsg: err.message }
+    });
+  }
+});
+
+console.log('🛠 Summary worker started');
+
+
+==================================================
+// languageDetector.js
+==================================================
+
+import { detect as ldDetect } from 'langdetect';
+
+const scriptRanges = {
+  // Devanagari scripts (Hindi, Marathi, Nepali)
+  hi: /[\u0900-\u097F]/g,   // Devanagari
+  mr: /[\u0900-\u097F]/g,   // Marathi (also Devanagari)
+  ne: /[\u0900-\u097F]/g,   // Nepali (also Devanagari)
+  
+  // Other Indian scripts
+  bn: /[\u0980-\u09FF]/g,   // Bengali
+  gu: /[\u0A80-\u0AFF]/g,   // Gujarati
+  pa: /[\u0A00-\u0A7F]/g,   // Gurmukhi (Punjabi)
+  ta: /[\u0B80-\u0BFF]/g,   // Tamil
+  te: /[\u0C00-\u0C7F]/g,   // Telugu
+  kn: /[\u0C80-\u0CFF]/g,   // Kannada
+  ml: /[\u0D00-\u0D7F]/g,   // Malayalam
+  or: /[\u0B00-\u0B7F]/g,   // Odia
+  
+  // Arabic script (Urdu, Arabic)
+  ur: /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/g,
+  ar: /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/g,
+  
+  // Chinese scripts
+  zh: /[\u4E00-\u9FFF\u3400-\u4DBF]/g,  // CJK Unified Ideographs
+  
+  // Japanese scripts
+  ja: /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]/g,  // Hiragana, Katakana, Kanji
+  
+  // Korean
+  ko: /[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]/g,  // Hangul
+  
+  // Thai
+  th: /[\u0E00-\u0E7F]/g,
+  
+  // Myanmar
+  my: /[\u1000-\u109F]/g,
+  
+  // Khmer
+  km: /[\u1780-\u17FF]/g
+};
+
+// Common Hindi words for better Devanagari disambiguation
+const hindiWords = [
+  'और', 'का', 'की', 'के', 'में', 'से', 'को', 'है', 'हैं', 'था', 'थी', 'थे',
+  'कि', 'यह', 'वह', 'इस', 'उस', 'एक', 'दो', 'तीन', 'आप', 'हम', 'तुम',
+  'क्या', 'कैसे', 'कहाँ', 'कब', 'क्यों', 'जो', 'जा', 'आना', 'जाना'
+];
+
+const marathiWords = [
+  'आणि', 'च्या', 'ची', 'चे', 'मध्ये', 'पासून', 'ला', 'आहे', 'आहेत', 'होता', 'होती', 'होते',
+  'की', 'हा', 'तो', 'या', 'त्या', 'एक', 'दोन', 'तीन', 'तुम्ही', 'आम्ही', 'तू'
+];
+
+const nepaliWords = [
+  'र', 'को', 'की', 'का', 'मा', 'बाट', 'लाई', 'छ', 'छन्', 'थियो', 'थिई', 'थिए',
+  'कि', 'यो', 'त्यो', 'यस', 'त्यस', 'एक', 'दुई', 'तीन', 'तपाईं', 'हामी', 'तिमी'
+];
+
+// Urdu vs Arabic distinction words
+const urduWords = [
+  'اور', 'کا', 'کی', 'کے', 'میں', 'سے', 'کو', 'ہے', 'ہیں', 'تھا', 'تھی', 'تھے',
+  'کہ', 'یہ', 'وہ', 'اس', 'اُس', 'ایک', 'دو', 'تین', 'آپ', 'ہم', 'تم'
+];
+
+function normalizeText(text) {
+  // Remove extra whitespace, numbers, punctuation for better analysis
+  return text.replace(/[0-9\s\p{P}]+/gu, ' ').trim();
+}
+
+function calculateScriptDensity(text, regex) {
+  const scriptChars = (text.match(regex) || []).length;
+  const totalChars = text.replace(/\s/g, '').length;
+  return totalChars > 0 ? scriptChars / totalChars : 0;
+}
+
+function detectDevanagariLanguage(text) {
+  const normalizedText = normalizeText(text);
+  
+  // Count word matches for each language
+  const hindiMatches = hindiWords.filter(word => 
+    normalizedText.includes(word)
+  ).length;
+  
+  const marathiMatches = marathiWords.filter(word => 
+    normalizedText.includes(word)
+  ).length;
+  
+  const nepaliMatches = nepaliWords.filter(word => 
+    normalizedText.includes(word)
+  ).length;
+  
+  // Return language with most matches, default to Hindi
+  if (marathiMatches > hindiMatches && marathiMatches > nepaliMatches) {
+    return 'mr';
+  } else if (nepaliMatches > hindiMatches && nepaliMatches > marathiMatches) {
+    return 'ne';
+  }
+  return 'hi'; // Default to Hindi for Devanagari
+}
+
+function detectArabicScript(text) {
+  const normalizedText = normalizeText(text);
+  
+  const urduMatches = urduWords.filter(word => 
+    normalizedText.includes(word)
+  ).length;
+  
+  // Simple heuristic: if we find Urdu words, it's likely Urdu
+  // Otherwise, default to Arabic
+  return urduMatches > 2 ? 'ur' : 'ar';
+}
+
+export function detectLanguage(text) {
+  if (!text || text.trim().length < 10) {
+    return 'en'; // Default for very short text
+  }
+  
+  const normalizedText = normalizeText(text);
+  const textLength = normalizedText.replace(/\s/g, '').length;
+  
+  // Minimum threshold for script detection (lowered for better sensitivity)
+  const SCRIPT_THRESHOLD = 0.05; // 5% of characters need to be from the script
+  
+  // 1) Check each script with density calculation
+  for (const [lang, regex] of Object.entries(scriptRanges)) {
+    const density = calculateScriptDensity(text, regex);
+    
+    if (density > SCRIPT_THRESHOLD) {
+      // Special handling for scripts used by multiple languages
+      if (lang === 'hi' && density > 0.1) { // Higher threshold for Devanagari
+        return detectDevanagariLanguage(text);
+      } else if (lang === 'ur' && density > 0.1) {
+        return detectArabicScript(text);
+      } else if (!['mr', 'ne', 'ar'].includes(lang)) {
+        // Return non-ambiguous scripts directly
+        return lang;
+      }
+    }
+  }
+  
+  // 2) Fallback to langdetect library with error handling
+  try {
+    const result = ldDetect(text);
+    
+    if (Array.isArray(result) && result.length > 0) {
+      // Take the highest confidence result
+      const bestMatch = result[0];
+      
+      // Only trust high-confidence results
+      if (bestMatch.prob > 0.7) {
+        return bestMatch.lang;
+      }
+      
+      // For lower confidence, check if it's a supported language
+      const supportedLangs = ['en', 'hi', 'bn', 'ta', 'te', 'gu', 'kn', 'ml', 'pa', 'or', 'ur', 'ar', 'zh', 'ja', 'ko', 'th', 'my', 'km'];
+      if (supportedLangs.includes(bestMatch.lang)) {
+        return bestMatch.lang;
+      }
+    } else if (typeof result === 'string') {
+      return result;
+    }
+  } catch (error) {
+    console.warn('Language detection fallback failed:', error.message);
+  }
+  
+  // 3) Final fallback: check for Latin script vs others
+  const latinChars = (text.match(/[a-zA-Z]/g) || []).length;
+  const latinDensity = latinChars / textLength;
+  
+  if (latinDensity > 0.7) {
+    return 'en'; // Likely English or another Latin-script language
+  }
+  
+  // 4) Ultimate fallback
+  return 'en';
+}
+
+// Export for compatibility with existing code
+export default { detect: detectLanguage };
+
+// Test function to validate detection
+export function testLanguageDetection() {
+  const testCases = [
+    { text: 'This is a test sentence in English.', expected: 'en' },
+    { text: 'यह एक परीक्षण वाक्य है। भारत एक विविधताओं से भरपूर देश है।', expected: 'hi' },
+    { text: 'এটি একটি পরীক্ষা বাক্য। বাংলাদেশ দক্ষিণ এশিয়ার একটি দেশ।', expected: 'bn' },
+    { text: 'இது ஒரு சோதனை வாக்கியம். தமிழ்நாடு இந்தியாவின் ஒரு மாநிலம்.', expected: 'ta' },
+    { text: 'ਇਹ ਇਕ ਟੈਸਟ ਵਾਕ ਹੈ। ਪੰਜਾਬ ਇੱਕ ਸੁੰਦਰ ਰਾਜ ਹੈ।', expected: 'pa' },
+    { text: 'یہ ایک ٹیسٹ جملہ ہے۔ پاکستان جنوبی ایشیا کا ایک ملک ہے۔', expected: 'ur' },
+    { text: 'हे एक चाचणी वाक्य आहे. महाराष्ट्र हा भारताचा एक राज्य आहे.', expected: 'mr' },
+  ];
+  
+  console.log('Language Detection Test Results:');
+  console.log('================================');
+  
+  testCases.forEach(({ text, expected }) => {
+    const detected = detectLanguage(text);
+    const status = detected === expected ? '✅' : '❌';
+    console.log(`${status} Expected: ${expected}, Got: ${detected}`);
+    console.log(`   Text: ${text.substring(0, 50)}...`);
+    console.log();
+  });
+}
+
+==================================================
+// test.js
+==================================================
+
+// test.js
+import detector from './languageDetector.js';  // adjust the path
+
+const samples = {
+  english: 'This is a test sentence in English.',
+  hindi: 'यह एक परीक्षण वाक्य है।',
+  bengali: 'এটি একটি পরীক্ষা বাক্য।',
+  tamil: 'இது ஒரு சோதனை வாக்கியம்.',
+  punjabi: 'ਇਹ ਇਕ ਟੈਸਟ ਵਾਕ ਹੈ।',
+  urdu: 'یہ ایک ٹیسٹ جملہ ہے۔',
+  mixed: 'Hello नमस्ते 123',
+};
+
+for (const [lang, text] of Object.entries(samples)) {
+  console.log(`${lang} →`, detector.detect(text));
+}
+
+
+==================================================
+// contentFetcher.js
+==================================================
+
+import axios from 'axios';
+import { parse } from 'node-html-parser';
+
+const fetch = async (url) => {
+  const { data: html } = await axios.get(url);
+  const root = parse(html);
+  const title = root.querySelector('title')?.text || '';
+  const articleEl = root.querySelector('article') || root;
+  return {
+    title: title.trim(),
+    text: articleEl.text.trim(),
+  };
+};
+
+export default { fetch };
+
+
+==================================================
+// summarizer.js
+==================================================
+
+import OpenAI from 'openai';
+import config from '../config/default.js';
+
+// Simple model configurations - just pricing, no token limits
+const MODEL_CONFIGS = {
+  'gpt-4.1-nano': {
+    costPerPromptToken: 0.10 / 1000000,    // $0.10 per 1M tokens
+    costPerResponseToken: 0.40 / 1000000,  // $0.40 per 1M tokens
+    maxOutputTokens: 300
+  },
+  'gpt-4.1-mini': {
+    costPerPromptToken: 0.40 / 1000000,    // $0.40 per 1M tokens
+    costPerResponseToken: 1.60 / 1000000,  // $1.60 per 1M tokens
+    maxOutputTokens: 500
+  },
+  'gpt-4o-mini': {
+    costPerPromptToken: 0.15 / 1000000,    // $0.15 per 1M tokens
+    costPerResponseToken: 0.60 / 1000000,  // $0.60 per 1M tokens
+    maxOutputTokens: 500
+  },
+  'gpt-4o': {
+    costPerPromptToken: 2.50 / 1000000,    // $2.50 per 1M tokens
+    costPerResponseToken: 10.00 / 1000000, // $10.00 per 1M tokens
+    maxOutputTokens: 800
+  },
+  'gpt-4-turbo': {
+    costPerPromptToken: 10.00 / 1000000,   // $10.00 per 1M tokens
+    costPerResponseToken: 30.00 / 1000000, // $30.00 per 1M tokens
+    maxOutputTokens: 1000
+  }
+};
+
+// Map ISO codes to human-readable names
+const languageNames = {
+  en: 'English',
+  hi: 'Hindi',
+  bn: 'Bengali',
+  ta: 'Tamil',
+  te: 'Telugu',
+  gu: 'Gujarati',
+  kn: 'Kannada',
+  ml: 'Malayalam',
+  pa: 'Punjabi',
+  or: 'Odia',
+  ur: 'Urdu',
+  ar: 'Arabic',
+  mr: 'Marathi',
+  ne: 'Nepali'
+};
+
+const openai = new OpenAI({ apiKey: config.openaiApiKey });
+
+/**
+ * Simple token estimation (for cost calculation only)
+ */
+function estimateTokens(text, language = 'en') {
+  const tokenMultipliers = {
+    en: 0.25,    // ~4 chars per token
+    hi: 0.35,    // Hindi
+    bn: 0.35,    // Bengali
+    ta: 0.35,    // Tamil
+    te: 0.35,    // Telugu
+    ar: 0.3,     // Arabic
+    ur: 0.3,     // Urdu
+    zh: 0.5,     // Chinese characters
+    default: 0.3
+  };
+  
+  const multiplier = tokenMultipliers[language] || tokenMultipliers.default;
+  return Math.ceil(text.length * multiplier);
+}
+
+function generateSystemPrompt(language) {
+  const langCode = language.toLowerCase();
+  const languageName = languageNames[langCode] || language;
+  
+  return `You are a professional summarization assistant.
+The article is in ${languageName}. Respond in ${languageName}.
+
+You will receive an Article Title and full Article Text.
+Your task is to return exactly one HTML <ul> block—no extra text or tags.
+
+<ul>
+  <li><b>One-sentence overview with the article's main event or claim, including a date or timestamp if given.</b></li>
+  <li>Key point 1: concise fact or argument (include figures, names, or dates).</li>
+  <li>Key point 2: concise fact or argument (include figures, names, or dates).</li>
+  <li>Key point 3: concise fact or argument (include figures, names, or dates).</li>
+  <li>Key point 4: concise fact or argument (include figures, names, or dates).</li>
+  <li>Key point 5: concise fact or argument (include figures, names, or dates).</li>
+</ul>
+
+Rules:
+1. Output only the <ul>…</ul> element.
+2. The first <li> must be bold (<b>…</b>) and encapsulate the article's core in one sentence with date/time.
+3. Provide exactly 6 <li> items total (1 overview + 5 facts).
+4. Each subsequent <li> must be a standalone, factual point drawn verbatim or tightly paraphrased.
+5. If the text contains any dates, figures, proper names, or concrete details, include at least one of those in every bullet.
+6. Do not add headings, commentary, qualifiers (e.g. "This shows"), or styling attributes.
+7. Preserve the article's original language and formatting of numerals/dates.
+8. Ensure no bullet is redundant—each must contribute new information.`.trim();
+}
+
+/**
+ * SIMPLIFIED summarize function - editor picks model, no token limits
+ */
+const summarize = async ({ title, text, language, model = 'gpt-4.1-nano' }) => {
+  const config = MODEL_CONFIGS[model];
+  if (!config) {
+    throw new Error(`Invalid model: ${model}. Available models: ${Object.keys(MODEL_CONFIGS).join(', ')}`);
+  }
+
+  const systemPrompt = generateSystemPrompt(language);
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    {
+      role: 'user',
+      content: `Article Title: ${title}
+
+Article Text:
+${text}
+
+Please output the summary as described above.`
+    },
+  ];
+
+  console.log(`🤖 Using model: ${model} for ${language} content (${text.length} chars)`);
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: model,
+      messages,
+      temperature: 0,
+      max_tokens: config.maxOutputTokens,
+    });
+
+    const html = resp.choices[0].message.content.trim();
+    const modelUsed = resp.model || model;
+    const promptTokens = resp.usage.prompt_tokens;
+    const responseTokens = resp.usage.completion_tokens;
+    
+    // Calculate actual cost using correct pricing
+    const actualCost = (promptTokens * config.costPerPromptToken) + 
+                      (responseTokens * config.costPerResponseToken);
+    
+    console.log(`💰 Cost: $${actualCost.toFixed(6)} (${modelUsed})`);
+    console.log(`📊 Tokens: ${promptTokens} prompt + ${responseTokens} response`);
+    
+    return { 
+      html, 
+      modelUsed, 
+      promptTokens, 
+      responseTokens,
+      estimatedCost: actualCost,
+      modelSelectionReason: 'manual',
+      wasTruncated: false
+    };
+  } catch (error) {
+    console.error(`❌ Summarization failed with ${model}:`, error.message);
+    throw error;
+  }
+};
+
+/**
+ * Get available models and their capabilities
+ */
+const getAvailableModels = () => {
+  return Object.entries(MODEL_CONFIGS).map(([name, config]) => ({
+    name,
+    costPerPromptToken: config.costPerPromptToken,
+    costPerResponseToken: config.costPerResponseToken,
+    maxOutputTokens: config.maxOutputTokens,
+    costPer1MPromptTokens: config.costPerPromptToken * 1000000,
+    costPer1MResponseTokens: config.costPerResponseToken * 1000000,
+  }));
+};
+
+/**
+ * Estimate cost for a given text (for warnings)
+ */
+const estimateCost = (title, text, language, modelName = 'gpt-4.1-nano') => {
+  const config = MODEL_CONFIGS[modelName];
+  if (!config) throw new Error(`Unknown model: ${modelName}`);
+  
+  const systemPrompt = generateSystemPrompt(language);
+  const userPrompt = `Article Title: ${title}\n\nArticle Text:\n${text}`;
+  const estimatedPromptTokens = estimateTokens(systemPrompt + userPrompt, language);
+  const estimatedResponseTokens = config.maxOutputTokens * 0.7; // Assume 70% of max
+  
+  const estimatedCost = (estimatedPromptTokens * config.costPerPromptToken) + 
+                       (estimatedResponseTokens * config.costPerResponseToken);
+  
+  return {
+    modelName,
+    estimatedPromptTokens,
+    estimatedResponseTokens,
+    estimatedCost,
+    warning: estimatedCost > 0.01 ? `High cost: $${estimatedCost.toFixed(4)}` : null
+  };
+};
+
+export default { 
+  summarize, 
+  getAvailableModels, 
+  estimateCost,
+  MODEL_CONFIGS 
+};
